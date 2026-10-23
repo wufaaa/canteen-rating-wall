@@ -15,6 +15,12 @@ secret.key
 *.bak
 canteen.db.bak
 
+# 打包文件（整个项目压一遍再传上来，等于仓库里有两份）
+*.zip
+*.tar.gz
+*.7z
+*.rar
+
 # 本地备份快照
 backups/
 
