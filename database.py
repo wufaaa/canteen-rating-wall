@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS windows (
     merchant_user TEXT UNIQUE NOT NULL,
     merchant_pass_hash TEXT NOT NULL,
     status INTEGER NOT NULL DEFAULT 1,
+    is_buffet INTEGER NOT NULL DEFAULT 0,
     UNIQUE(canteen, floor, win_no)
 );
 CREATE TABLE IF NOT EXISTS dishes (
@@ -46,6 +47,7 @@ CREATE TABLE IF NOT EXISTS dishes (
     price REAL NOT NULL,
     intro TEXT NOT NULL DEFAULT '',
     photo TEXT NOT NULL DEFAULT '',
+    stall TEXT NOT NULL DEFAULT '',
     status INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL
 );
@@ -68,6 +70,7 @@ CREATE TABLE IF NOT EXISTS posts (
     anon_id INTEGER NOT NULL,
     content TEXT NOT NULL,
     photo TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     status INTEGER NOT NULL DEFAULT 1
 );
@@ -78,6 +81,26 @@ CREATE TABLE IF NOT EXISTS post_likes (
     created_at TEXT NOT NULL,
     UNIQUE(post_id, anon_id)
 );
+CREATE TABLE IF NOT EXISTS dish_ratings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    anon_id INTEGER NOT NULL,
+    dish_id INTEGER NOT NULL,
+    vote INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(anon_id, dish_id, date)
+);
+CREATE INDEX IF NOT EXISTS idx_dish_ratings_dish ON dish_ratings(dish_id);
+CREATE TABLE IF NOT EXISTS dish_ratings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    anon_id INTEGER NOT NULL,
+    dish_id INTEGER NOT NULL,
+    vote INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(anon_id, dish_id, date)
+);
+CREATE INDEX IF NOT EXISTS idx_dish_ratings_dish ON dish_ratings(dish_id);
 CREATE TABLE IF NOT EXISTS reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     post_id INTEGER NOT NULL,
@@ -95,13 +118,15 @@ CREATE TABLE IF NOT EXISTS admin_logs (
 );
 """
 
-# ---------------------------------------------------------------- 窗口（3 食堂 × 2 层 × 10 窗口）
+# ---------------------------------------------------------------- 窗口（3 食堂 × 2 层 × 10 窗口 + 第四食堂·东油饺子园 × 1 层 × 10 窗口
+#                + 一/二食堂自选餐档口）自选餐档口开启菜品级好评/差评投票
 # (canteen, floor, win_no, 窗口名, 商家名)
 WINDOWS = [
     (1, 1, 1, "兰州拉面", "马记面馆"), (1, 1, 2, "黄焖鸡米饭", "杨铭宇黄焖鸡"), (1, 1, 3, "川湘小炒", "川妹子餐饮"),
     (1, 1, 4, "东北饺子馆", "老边饺子坊"), (1, 1, 5, "麻辣香锅", "锅色天香"), (1, 1, 6, "老式蛋炒饭", "阿强炒饭"),
     (1, 1, 7, "广式烧腊", "陈师傅烧腊"), (1, 1, 8, "早餐粥铺", "晨光早点"), (1, 1, 9, "番茄鸡蛋盖饭", "好味盖浇"),
     (1, 1, 10, "铁板炒面", "老金炒面"),
+    (1, 1, 11, "自选餐", "一食堂自选餐档口"),
     (1, 2, 1, "蜀香麻辣烫", "蓉城麻辣烫"), (1, 2, 2, "韩式石锅拌饭", "首尔厨房"), (1, 2, 3, "柳州螺蛳粉", "螺味轩"),
     (1, 2, 4, "瓦罐煨汤", "赣味煨汤"), (1, 2, 5, "甜品糖水铺", "顺记糖水"), (1, 2, 6, "炸鸡汉堡", "麦肯基"),
     (1, 2, 7, "西北羊肉泡馍", "老孙家泡馍"), (1, 2, 8, "川味冒菜", "冒菜大叔"), (1, 2, 9, "潮汕砂锅粥", "潮汕兄弟粥铺"),
@@ -110,6 +135,7 @@ WINDOWS = [
     (2, 1, 4, "手抓饼卷饼", "饼叔"), (2, 1, 5, "快餐自助", "大众快餐"), (2, 1, 6, "粤式烧味", "广府烧味"),
     (2, 1, 7, "韩式炸鸡", "桥村炸鸡"), (2, 1, 8, "老家馄饨", "千里香馄饨"), (2, 1, 9, "肉夹馍凉皮", "秦味轩"),
     (2, 1, 10, "营养套餐", "营养配餐中心"),
+    (2, 1, 11, "自选餐", "二食堂自选餐档口"),
     (2, 2, 1, "重庆小面", "渝记小面"), (2, 2, 2, "东北铁锅炖", "关东大院"), (2, 2, 3, "新疆大盘鸡", "天山食府"),
     (2, 2, 4, "云南过桥米线", "滇香园"), (2, 2, 5, "咖喱蛋包饭", "洋风厨房"), (2, 2, 6, "泰式简餐", "曼谷小馆"),
     (2, 2, 7, "健身轻食", "轻卡餐吧"), (2, 2, 8, "果切鲜榨", "鲜果时光"), (2, 2, 9, "夜宵烧烤", "炭火故事"),
@@ -122,6 +148,10 @@ WINDOWS = [
     (3, 2, 4, "东北乱炖", "翠花上菜"), (3, 2, 5, "台湾卤肉饭", "宝岛风味"), (3, 2, 6, "港式烧饭", "港岛茶餐厅"),
     (3, 2, 7, "轻食沙拉吧", "绿洲沙拉"), (3, 2, 8, "鲜果捞", "甜心果捞"), (3, 2, 9, "烘焙工坊", "麦子熟了"),
     (3, 2, 10, "咖啡轻食", "校园咖啡角"),
+    (4, 1, 1, "酸菜猪肉饺", "老坛酸菜馆"), (4, 1, 2, "三鲜水饺", "海味三鲜居"), (4, 1, 3, "牛肉大葱饺", "北疆饺庄"),
+    (4, 1, 4, "韭菜鸡蛋饺", "农家韭香园"), (4, 1, 5, "玉米猪肉饺", "金穗饺子屋"), (4, 1, 6, "虾仁蒸饺", "鲜虾蒸饺王"),
+    (4, 1, 7, "煎饺锅贴", "金底锅贴铺"), (4, 1, 8, "酸汤水饺", "老陕酸汤坊"), (4, 1, 9, "香菇青菜饺", "素香饺子斋"),
+    (4, 1, 10, "熏酱凉菜拼", "关东熏酱坊"),
 ]
 
 # ---------------------------------------------------------------- 每个窗口的菜品示例（窗口名 -> [(菜名, 价格, 简介, 照片)]）
@@ -186,7 +216,35 @@ DISH_MAP = {
     "鲜果捞": [("缤纷水果捞", 13.0, "六种应季水果+酸奶", ""), ("杨梅冰汤圆", 12.0, "当季杨梅，酸甜爆汁", ""), ("椰奶芒果捞", 14.0, "椰浆浓郁", "")],
     "烘焙工坊": [("现烤吐司(2片)", 6.0, "现点现烤，黄油焦香", ""), ("岩烧乳酪蛋糕", 9.0, "芝士流心，限售每日30份", ""), ("海盐牛角包", 7.0, "外脆内软层层酥", "")],
     "咖啡轻食": [("美式咖啡(中杯)", 10.0, "现磨豆，学生价第二杯半价", ""), ("拿铁+贝果套餐", 18.0, "早八救星组合", ""), ("挂耳咖啡包(10包)", 25.0, "自习室续命装", "")],
+    "酸菜猪肉饺": [("酸菜猪肉水饺(15只)", 12.0, "东北酸菜现拌馅，酸香开胃", ""), ("酸菜猪肉蒸饺(10只)", 12.0, "现包现蒸，汁水足", ""), ("饺子+黑酱小碟套餐", 16.0, "水饺配重酱小碟", "")],
+    "三鲜水饺": [("三鲜水饺(15只)", 14.0, "虾仁鸡蛋韭菜，皮薄馅大", ""), ("三鲜饨饨", 11.0, "大馅饨饨，紫菜虾皮汤", ""), ("全家福水饺(20只)", 19.0, "四种馅料拼一盘", "")],
+    "牛肉大葱饺": [("牛肉大葱水饺(15只)", 15.0, "牛肉现剁，大葱提香", ""), ("牛肉蒸饺(10只)", 15.0, "个头大，咬一口爆汁", ""), ("牛肉汤饺套餐", 18.0, "水饺配牛肉原汤", "")],
+    "韭菜鸡蛋饺": [("韭菜鸡蛋水饺(15只)", 10.0, "头茬韭菜配土鸡蛋", ""), ("韭菜盒子", 6.0, "现烙，外皮酥脆", ""), ("素馅蒸饺(10只)", 9.0, "韭菜鸡蛋粉丝馅", "")],
+    "玉米猪肉饺": [("玉米猪肉水饺(15只)", 12.0, "甜玉米粒，清甜多汁", ""), ("玉米蒸饺(10只)", 12.0, "蒸笼现出，口感弹嫩", ""), ("饺子+小米粥套餐", 14.0, "水饺配现熬粥", "")],
+    "虾仁蒸饺": [("虾仁蒸饺(8只)", 16.0, "整只虾仁，鲜甜弹牙", ""), ("蟹黄蒸饺(8只)", 15.0, "蟹黄风味，鲜香浓郁", ""), ("蒸饺+骨汤套餐", 18.0, "蒸饺配海带骨汤", "")],
+    "煎饺锅贴": [("冰花煎饺(10只)", 12.0, "底壳金黄脆亮，蘸醋更香", ""), ("牛肉锅贴(8只)", 14.0, "外脆里嫩，汤汁丰盈", ""), ("煎饺+豆浆套餐", 13.0, "现磨豆浆解腻", "")],
+    "酸汤水饺": [("酸汤水饺(12只)", 12.0, "酸辣汤底，饺子现煮", ""), ("酸汤饨饨", 11.0, "香醋辣油，开胃暖身", ""), ("酸汤饺子+拌菜套餐", 15.0, "配东北大拉皮", "")],
+    "香菇青菜饺": [("香菇青菜水饺(15只)", 10.0, "菌菇清香，素食友好", ""), ("香菇蒸饺(10只)", 10.0, "鲜嫩多汁", ""), ("素馅饺子+拌木耳套餐", 13.0, "清淡不腻", "")],
+    "熏酱凉菜拼": [("东北熏酱拼盘", 16.0, "熏肠酱肚，下酒下饭", ""), ("大拉皮", 9.0, "麻酱芥末，爽滑筋道", ""), ("熏酱+饺子套餐", 17.0, "拼盘配10只水饺", "")],
+    "自选餐": [("红烧肉", 6.0, "肥瘦相间，酱香浓郁", ""), ("糖醋里脊", 6.0, "外酥里嫩，酸甜口", ""), ("宫保鸡丁", 5.0, "花生脆，微辣带甜", ""), ("鱼香肉丝", 5.0, "经典下饭菜，酸甜咸香", ""), ("可乐鸡翅", 6.0, "甜咸口，先到先得", ""), ("辣子鸡", 6.0, "香辣过瘾，越吃越上头", ""), ("木须肉", 5.0, "肉片鸡蛋木耳，清淡口", ""), ("干煸豆角", 4.0, "干香入味，注意烫嘴", ""), ("红烧茄子", 4.0, "油润软糯，拌饭一绝", ""), ("麻婆豆腐", 3.5, "麻辣鲜香，嫩滑", ""), ("番茄炒蛋", 3.5, "国民家常菜，汤汁拌饭", ""), ("蒜蓉油麦菜", 3.0, "清爽解腻", ""), ("番茄麻辣烫", 13.0, "酸甜汤底，煮菜吸味", ""), ("骨汤麻辣烫", 14.0, "大骨汤底，麻辣适中", ""), ("藤椒麻辣烫", 14.0, "藤椒麻香，微微舌麻", ""), ("干拌麻辣烫", 13.0, "无汤干拌，酱料裹满", ""), ("自助称重麻辣烫", 15.0, "荤素自选称重，丰俭由人", "")],
 }
+
+# 自选餐档口（窗口级标记，页面展示菜品级好评/差评投票）
+BUFFET_WINDOWS = {(1, 1, 11), (2, 1, 11)}
+
+# 自选餐分档：档口名 -> 该档口菜品名（未列出的自选餐菜品归入 BUFFET_DEFAULT_STALL）
+BUFFET_STALLS = {
+    "自选麻辣烫": ["番茄麻辣烫", "骨汤麻辣烫", "藤椒麻辣烫", "干拌麻辣烫", "自助称重麻辣烫"],
+}
+BUFFET_DEFAULT_STALL = "自选菜"
+
+
+def buffet_stall_of(name):
+    """按菜名返回所属自选档口"""
+    for stall, names in BUFFET_STALLS.items():
+        if name in names:
+            return stall
+    return BUFFET_DEFAULT_STALL
 
 # ---------------------------------------------------------------- 匿名昵称生成
 ADJECTIVES = ["爱吃拌面的", "干饭超快的", "中午抢饭的", "无辣不欢的", "碳水战士", "汤底守护",
@@ -346,9 +404,59 @@ def _migrate():
         cols = [r[1] for r in conn.execute("PRAGMA table_info(posts)")]
         if "photo" not in cols:
             conn.execute("ALTER TABLE posts ADD COLUMN photo TEXT NOT NULL DEFAULT ''")
+        if "category" not in cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN category TEXT NOT NULL DEFAULT ''")
+        wcols = [r[1] for r in conn.execute("PRAGMA table_info(windows)")]
+        if "is_buffet" not in wcols:
+            conn.execute("ALTER TABLE windows ADD COLUMN is_buffet INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS dish_ratings ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT, anon_id INTEGER NOT NULL, dish_id INTEGER NOT NULL,"
+            " vote INTEGER NOT NULL, date TEXT NOT NULL, created_at TEXT NOT NULL,"
+            " UNIQUE(anon_id, dish_id, date))")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dish_ratings_dish ON dish_ratings(dish_id)")
+        dcols = [r[1] for r in conn.execute("PRAGMA table_info(dishes)")]
+        if "stall" not in dcols:
+            conn.execute("ALTER TABLE dishes ADD COLUMN stall TEXT NOT NULL DEFAULT ''")
+        # 增量补充新增的食堂/窗口（如：第四食堂·东油饺子园、一/二食堂自选餐档口）
+        _seed_missing_windows(conn)
+        # 自选餐分档：补插新档口菜品并回填归属（幂等）
+        for wid, in conn.execute("SELECT id FROM windows WHERE is_buffet=1").fetchall():
+            for (dname, price, intro, photo) in DISH_MAP.get("自选餐", []):
+                row = conn.execute("SELECT id FROM dishes WHERE window_id=? AND name=?", (wid, dname)).fetchone()
+                if row:
+                    conn.execute("UPDATE dishes SET stall=? WHERE id=?", (buffet_stall_of(dname), row["id"]))
+                else:
+                    conn.execute(
+                        "INSERT INTO dishes(window_id, name, price, intro, photo, stall, status, updated_at)"
+                        " VALUES (?,?,?,?,?,?,1,?)",
+                        (wid, dname, price, intro, photo, buffet_stall_of(dname), now_str()))
         conn.commit()
     finally:
         conn.close()
+
+
+def _seed_missing_windows(conn, only_canteen=None):
+    """向已有库补充 WINDOWS 清单里缺失的窗口与菜品（幂等）"""
+    cur = conn.cursor()
+    for c, f, n, name, mch in WINDOWS:
+        if only_canteen is not None and c != only_canteen:
+            continue
+        if cur.execute("SELECT 1 FROM windows WHERE canteen=? AND floor=? AND win_no=?",
+                       (c, f, n)).fetchone():
+            continue
+        user = "c%d-%d-%02d" % (c, f, n)
+        cur.execute(
+            "INSERT INTO windows(canteen, floor, win_no, name, merchant_name, merchant_user, merchant_pass_hash, status, is_buffet)"
+            " VALUES (?,?,?,?,?,?,?,1,?)",
+            (c, f, n, name, mch, user, generate_password_hash("shop123456"),
+             1 if (c, f, n) in BUFFET_WINDOWS else 0))
+        win_id = cur.lastrowid
+        for (dname, price, intro, photo) in DISH_MAP.get(name, []):
+            stall = buffet_stall_of(dname) if (c, f, n) in BUFFET_WINDOWS else ""
+            cur.execute(
+                "INSERT INTO dishes(window_id, name, price, intro, photo, stall, status, updated_at) VALUES (?,?,?,?,?,?,1,?)",
+                (win_id, dname, price, intro, photo, stall, now_str()))
 
 
 def init_db(force=False):
@@ -377,6 +485,8 @@ def init_db(force=False):
             " VALUES (?,?,?,?,?,?,?,1)",
             (c, f, n, name, mch, user, generate_password_hash("shop123456")))
         win_id = cur.lastrowid
+        if (c, f, n) in BUFFET_WINDOWS:
+            cur.execute("UPDATE windows SET is_buffet=1 WHERE id=?", (win_id,))
         # 菜品
         dish_ids = []
         for (dname, price, intro, photo) in DISH_MAP[name]:

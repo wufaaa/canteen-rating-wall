@@ -464,12 +464,35 @@ def api_window(wid):
             return err("窗口不存在", 404)
         dishes = c.execute(
             "SELECT * FROM dishes WHERE window_id=? AND status=1 ORDER BY id", (wid,)).fetchall()
+        buffet = bool(w["is_buffet"])
+        dish_items = [dict(x) for x in dishes]
+        if buffet:
+            ids = [x["id"] for x in dish_items]
+            gmap, bmap, mymap = {}, {}, {}
+            if ids:
+                qmarks = ",".join("?" * len(ids))
+                for row in c.execute(
+                        "SELECT dish_id, SUM(vote=1) g, SUM(vote=0) b FROM dish_ratings "
+                        "WHERE dish_id IN (%s) GROUP BY dish_id" % qmarks, ids):
+                    gmap[row["dish_id"]], bmap[row["dish_id"]] = row["g"], row["b"]
+                for row in c.execute(
+                        "SELECT dish_id, vote FROM dish_ratings WHERE anon_id=? AND dish_id IN (%s) AND date=?" % qmarks,
+                        [aid] + ids + [today_str()]):
+                    mymap[row["dish_id"]] = "good" if row["vote"] == 1 else "bad"
+            for x in dish_items:
+                x["good_cnt"] = gmap.get(x["id"], 0)
+                x["bad_cnt"] = bmap.get(x["id"], 0)
+                x["my_vote"] = mymap.get(x["id"])
         avg_row = c.execute(
             "SELECT ROUND(AVG(score),2) avg_score, COUNT(*) cnt FROM ratings "
             "WHERE window_id=? AND strftime('%Y-%m', date)=?", (wid, month)).fetchone()
         total_row = c.execute(
             "SELECT COUNT(*) cnt, ROUND(AVG(score),2) avg_score FROM ratings WHERE window_id=?",
             (wid,)).fetchone()
+        gb = c.execute(
+            "SELECT COALESCE(SUM(CASE WHEN score>=4 THEN 1 ELSE 0 END),0) good_cnt, "
+            "COALESCE(SUM(CASE WHEN score<=2 THEN 1 ELSE 0 END),0) bad_cnt FROM ratings "
+            "WHERE window_id=? AND strftime('%Y-%m', date)=?", (wid, month)).fetchone()
         rank_map = window_rank_map(c, month)
         my_today = c.execute(
             "SELECT score FROM ratings WHERE anon_id=? AND window_id=? AND date=?",
@@ -480,8 +503,10 @@ def api_window(wid):
     return ok({"window": {**_window_brief(w), "avg_score": avg_row["avg_score"],
                           "month_cnt": avg_row["cnt"], "total_cnt": total_row["cnt"],
                           "total_avg": total_row["avg_score"], "rank": rank_map.get(wid),
+                          "good_cnt": gb["good_cnt"], "bad_cnt": gb["bad_cnt"],
+                          "is_buffet": buffet,
                           "post_cnt": post_cnt},
-               "dishes": [dict(d) for d in dishes],
+               "dishes": dish_items,
                "my_today_score": my_today["score"] if my_today else None,
                "today_rated": rated, "quota_left": left, "quota_total": DAILY_WINDOW_QUOTA})
 
@@ -527,6 +552,7 @@ def api_window_posts(wid):
         def to_post(p, is_reply=False):
             item = {"id": p["id"], "nickname": p["nickname"], "content": p["content"],
                     "photo": (p["photo"] or ""), "created_at": p["created_at"],
+                    "category": p["category"] or "",
                     "dish": dish_tag(p["dish_id"]),
                     "likes": likes_map.get(p["id"], 0), "liked": p["id"] in my_likes,
                     "reply_count": len(replies_map.get(p["id"], []))}
@@ -535,6 +561,33 @@ def api_window_posts(wid):
             return item
 
         return ok({"posts": [to_post(p) for p in mains]})
+
+
+@app.route("/api/warnings")
+def api_warnings():
+    """差评避雷：集中收录全平台差评帖（匿名）"""
+    month = this_month()
+    with get_db() as c:
+        stats = c.execute(
+            "SELECT COUNT(*) cnt, COUNT(DISTINCT window_id) win_cnt FROM posts "
+            "WHERE category='bad' AND status=1 AND parent_id IS NULL AND strftime('%Y-%m', created_at)=?",
+            (month,)).fetchone()
+        top = c.execute(
+            "SELECT w.id, w.name, w.canteen, w.floor, w.win_no, COUNT(*) bad_cnt "
+            "FROM posts p JOIN windows w ON w.id=p.window_id "
+            "WHERE p.category='bad' AND p.status=1 AND p.parent_id IS NULL "
+            "AND strftime('%Y-%m', p.created_at)=? "
+            "GROUP BY w.id ORDER BY bad_cnt DESC, w.id LIMIT 5", (month,)).fetchall()
+        items = c.execute(
+            "SELECT p.id, p.content, p.photo, p.created_at, w.id AS window_id, w.name AS window_name, "
+            "w.canteen, w.floor, w.win_no, a.nickname, "
+            "(SELECT COUNT(*) FROM post_likes pl WHERE pl.post_id=p.id) AS likes, "
+            "(SELECT COUNT(*) FROM posts rp WHERE rp.parent_id=p.id AND rp.status=1) AS reply_count "
+            "FROM posts p JOIN windows w ON w.id=p.window_id JOIN anons a ON a.id=p.anon_id "
+            "WHERE p.category='bad' AND p.status=1 AND p.parent_id IS NULL "
+            "ORDER BY p.created_at DESC LIMIT 50").fetchall()
+    return ok({"month_bad_cnt": stats["cnt"], "window_cnt": stats["win_cnt"],
+               "top_windows": [dict(t) for t in top], "items": [dict(i) for i in items]})
 
 
 # ---------------------------------------------------------------- 学生：打分 / 发帖 / 点赞 / 举报
@@ -559,7 +612,7 @@ def api_rate():
         already = c.execute("SELECT score FROM ratings WHERE anon_id=? AND window_id=? AND date=?",
                             (aid, wid, today_str())).fetchone()
         if already:
-            return err("今天已经给这个窗口打过 %d 星啦，明天再来" % already["score"])
+            return err("今天已经评价过这个窗口啦，明天再来")
         rated, left = quota_state(c, aid)
         if left <= 0:
             return err("今天 3 次打分机会已用完，明天再来吧")
@@ -574,6 +627,37 @@ def api_rate():
                    "my_today_score": score})
 
 
+@app.route("/api/dishes/<int:did>/vote", methods=["POST"])
+@require_anon
+def api_dish_vote(did):
+    """自选餐菜品级好评/差评（每人每菜每天一票）"""
+    data = request.get_json(force=True, silent=True) or {}
+    vote = data.get("vote")
+    if vote not in ("good", "bad"):
+        return err("参数错误")
+    aid = current_anon_id()
+    with get_db() as c:
+        d = c.execute(
+            "SELECT d.id, w.status AS wstatus FROM dishes d JOIN windows w ON w.id=d.window_id "
+            "WHERE d.id=? AND d.status=1", (did,)).fetchone()
+        if not d:
+            return err("菜品不存在", 404)
+        if d["wstatus"] != 1:
+            return err("该窗口已停用")
+        already = c.execute(
+            "SELECT vote FROM dish_ratings WHERE anon_id=? AND dish_id=? AND date=?",
+            (aid, did, today_str())).fetchone()
+        if already:
+            return err("今天已经评价过这道菜啦，明天再来")
+        c.execute("INSERT INTO dish_ratings(anon_id, dish_id, vote, date, created_at) VALUES (?,?,?,?,?)",
+                  (aid, did, 1 if vote == "good" else 0, today_str(), now()))
+        cnts = c.execute(
+            "SELECT COALESCE(SUM(vote=1),0) good_cnt, COALESCE(SUM(vote=0),0) bad_cnt "
+            "FROM dish_ratings WHERE dish_id=?", (did,)).fetchone()
+        return ok({"dish_id": did, "good_cnt": cnts["good_cnt"], "bad_cnt": cnts["bad_cnt"],
+                   "my_vote": vote})
+
+
 @app.route("/api/posts", methods=["POST"])
 @require_anon
 def api_create_post():
@@ -581,6 +665,11 @@ def api_create_post():
     content = (data.get("content") or "").strip()
     if not 1 <= len(content) <= 500:
         return err("内容长度需在 1~500 字之间")
+    category = data.get("category") or ""
+    if category not in ("", "good", "bad"):
+        return err("评论类别不合法")
+    if category == "bad" and len(content) < 10:
+        return err("差评需要有理有据：请至少用 10 个字说明情况（哪道菜、什么问题、什么时间）")
     try:
         wid = int(data.get("window_id"))
     except (TypeError, ValueError):
@@ -598,14 +687,15 @@ def api_create_post():
                           (dish_id, wid)).fetchone()
             if not d:
                 return err("关联的菜品不存在")
-        c.execute("INSERT INTO posts(window_id, parent_id, dish_id, anon_id, content, created_at, status)"
-                  " VALUES (?,?,?,?,?,?,1)", (wid, None, dish_id, aid, content, now()))
+        c.execute("INSERT INTO posts(window_id, parent_id, dish_id, anon_id, content, category, created_at, status)"
+                  " VALUES (?,?,?,?,?,?,?,1)", (wid, None, dish_id, aid, content, category, now()))
         pid = c.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
         nickname = get_nickname(c, aid)
         dish_row = None
         if dish_id is not None:
             dish_row = c.execute("SELECT id, name, price FROM dishes WHERE id=?", (dish_id,)).fetchone()
         return ok({"post": {"id": pid, "nickname": nickname, "content": content, "created_at": now(),
+                           "category": category,
                            "dish": {"id": dish_row["id"], "name": dish_row["name"],
                                     "price": dish_row["price"]} if dish_row else None,
                            "likes": 0, "liked": False, "reply_count": 0, "replies": []}})
@@ -707,7 +797,7 @@ def api_my():
             "w.canteen, w.floor, w.win_no FROM ratings r JOIN windows w ON w.id=r.window_id "
             "WHERE r.anon_id=? ORDER BY r.created_at DESC LIMIT 100", (aid,)).fetchall()
         my_posts = c.execute(
-            "SELECT p.id, p.content, p.created_at, p.parent_id, w.name AS window_name, w.id AS window_id "
+            "SELECT p.id, p.content, p.created_at, p.parent_id, p.category, w.name AS window_name, w.id AS window_id "
             "FROM posts p JOIN windows w ON w.id=p.window_id "
             "WHERE p.anon_id=? AND p.status=1 ORDER BY p.created_at DESC LIMIT 100", (aid,)).fetchall()
         my_likes = c.execute("SELECT COUNT(*) cnt FROM post_likes WHERE anon_id=?", (aid,)).fetchone()["cnt"]
