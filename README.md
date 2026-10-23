@@ -34,19 +34,28 @@
 
 环境要求：Python 3.8 及以上。
 
+**Windows 最省事**：双击 `start.bat` —— 自动建虚拟环境、装依赖、起服务、等服务就绪后自动打开浏览器。
+
+**手动启动**：
+
 ```bash
 # 1. 安装依赖
 pip install -r requirements.txt
 
 # 2. 启动（首次启动会自动建库并写入演示数据）
-python app.py
+python run.py          # 推荐：起服务并自动打开浏览器
+# 或
+python app.py          # 只起服务，自己开浏览器
 
 # 3. 浏览器打开
 #    本机：  http://127.0.0.1:5001
-#    局域网：把 app.py 底部的 HOST 改成 0.0.0.0 后重新运行
+#    局域网：设 HOST=0.0.0.0 环境变量后重新运行
 ```
 
-> 不想配 Python 环境？双击 `start.bat`（Windows）会自动建虚拟环境并安装依赖。
+> ⚠️ **双击 `static/index.html` 是打不开的**（一片空白）。
+> 这个项目是 Flask 应用，页面必须由后端 `http://127.0.0.1:5001` 提供；
+> `index.html` 里引用的是 `/style.css`、`/app.js` 这样的绝对路径，直接从硬盘打开会全部加载失败。
+> 必须先启动服务，再访问 `127.0.0.1:5001`。
 
 ---
 
@@ -79,7 +88,8 @@ canteen/
 ├── uploads/              # 演示菜品图与帖子配图（已随仓库提供）
 ├── tool.py               # 版本管理：save / rollback / db 快照
 ├── requirements.txt
-├── start.bat             # Windows 一键启动
+├── start.bat             # Windows 一键启动（双击即可）
+├── run.py                # 启动器：查依赖 -> 起服务 -> 自动开浏览器
 └── README.md
 ```
 
