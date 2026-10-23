@@ -368,6 +368,7 @@ def ask(prompt, timeout=150):
 # 「渲染器领任务」派发，同步执行到完成，实测点菜 4~14 秒（取决于模型档位）。
 _ENGINE_BASE = "http://127.0.0.1:4397"
 _ENGINE_DIR = os.path.join(os.environ.get("TEMP", "C:/tmp"), "canteen-ai-ws")
+_ENGINE_PROVIDER = os.environ.get("AI_ENGINE_PROVIDER", "NewApi")
 _ENGINE_CREDS = {}
 _ENGINE_SESSION = None
 
@@ -484,7 +485,7 @@ def engine_ask(prompt, model="chat-lite", timeout=30):
             return None
     st, body = _engine_call("POST", "/session/%s/message" % _ENGINE_SESSION, {
         "parts": [{"type": "text", "text": prompt}],
-        "model": {"providerID": "NewApi", "modelID": model}}, timeout=timeout)
+        "model": {"providerID": _ENGINE_PROVIDER, "modelID": model}}, timeout=timeout)
     if st != 200:
         _ENGINE_SESSION = None
         return None
@@ -572,7 +573,7 @@ def engine_stream(prompt, model="chat-lite", timeout=30):
     def sender():
         st, body = _engine_call("POST", "/session/%s/message" % sid, {
             "parts": [{"type": "text", "text": prompt}],
-            "model": {"providerID": "NewApi", "modelID": model}}, timeout=timeout)
+            "model": {"providerID": _ENGINE_PROVIDER, "modelID": model}}, timeout=timeout)
         if st != 200:
             q.put(("error", None, "HTTP %s: %s" % (st, str(body)[:150])))
             return

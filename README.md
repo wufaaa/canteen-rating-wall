@@ -94,6 +94,8 @@ canteen/
 | `PORT` | `5001` | 监听端口 |
 | `HOST` | `0.0.0.0` | 监听地址（`127.0.0.1` 仅本机） |
 | `ADMIN_PASSWORD` | `admin@2026` | 管理员口令；设置后下次建库生效 |
+| `AI_ENGINE_MODEL` | `chat-lite` | TeleAgent 引擎模型档位（`chat-lite` / `chat-pro` / `chat-flagship`） |
+| `AI_ENGINE_PROVIDER` | `NewApi` | TeleAgent 引擎 provider 名 |
 
 ---
 
