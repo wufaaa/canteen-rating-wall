@@ -20,7 +20,7 @@ from functools import wraps
 
 CN_TZ = timezone(timedelta(hours=8))
 
-from flask import Flask, jsonify, request, send_from_directory, session
+from flask import Flask, jsonify, request, send_from_directory, session, Response
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
@@ -718,7 +718,472 @@ def api_my():
                "likes_given": my_likes})
 
 
-# ---------------------------------------------------------------- 商家端
+# ---------------------------------------------------------------- AI 点菜助手
+def _ai_data_summary(conn):
+    """把菜品+评分+月榜+学生评论压成紧凑文本喂给 TeleAgent 智能体（每次实时查库）"""
+    cn = ["一", "二", "三"]
+    rows = conn.execute("""
+        SELECT w.id AS wid, w.canteen, w.floor, w.name AS wname, d.name AS dname, d.price, d.intro,
+               (SELECT ROUND(AVG(r.score),2) FROM ratings r WHERE r.window_id=w.id) AS avg_score
+        FROM dishes d JOIN windows w ON w.id=d.window_id
+        WHERE d.status=1 AND w.status=1 ORDER BY w.id, d.price
+    """).fetchall()
+
+    # 本月榜单 Top10（均分/评分人数）
+    board_rows = conn.execute("""
+        SELECT w.id, w.canteen, w.floor, w.name AS wname,
+               ROUND(AVG(r.score),2) AS a, COUNT(*) AS n
+        FROM ratings r JOIN windows w ON w.id=r.window_id
+        WHERE strftime('%Y-%m', r.date)=? GROUP BY w.id ORDER BY a DESC, n DESC LIMIT 10
+    """, (this_month(),)).fetchall()
+
+    # 学生评论：每窗口点赞最高的 2 条（截 40 字），含口味/分量/排队等真实反馈
+    comments_by_win = {}
+    for p in conn.execute("""
+        SELECT p.window_id AS wid, p.content,
+               (SELECT COUNT(*) FROM post_likes pl WHERE pl.post_id=p.id) AS likes
+        FROM posts p WHERE p.status=1
+        ORDER BY likes DESC, p.created_at DESC
+    """).fetchall():
+        comments_by_win.setdefault(p["wid"], []).append((p["content"], p["likes"]))
+
+    parts = ["【菜品数据】格式：位置|菜名|价格|简介|窗口评分"]
+    for r in rows:
+        parts.append("%s食堂%d楼%s|%s|¥%.1f|%s|评分%s" % (
+            cn[r["canteen"] - 1], r["floor"], r["wname"], r["dname"],
+            r["price"], r["intro"], r["avg_score"] or "暂无"))
+    if board_rows:
+        parts.append("\n【本月榜单Top10】")
+        for i, b in enumerate(board_rows):
+            parts.append("%d.%s(%s食堂%d楼) 均分%s/%s人评" % (
+                i + 1, b["wname"], cn[b["canteen"] - 1], b["floor"], b["a"], b["n"]))
+    parts.append("\n【学生评论精选】每窗口点赞最高的评论（截选，反映分量/口味/排队等真实口碑）")
+    wins = {}
+    for r in rows:
+        wins.setdefault(r["wid"], (r["canteen"], r["floor"], r["wname"]))
+    for wid, (c, f, name) in wins.items():
+        cs = comments_by_win.get(wid)
+        if not cs:
+            continue
+        joined = " / ".join("「%s」赞%d" % (c[:40], l) for c, l in cs[:2])
+        parts.append("%s食堂%d楼%s：%s" % (cn[c - 1], f, name, joined))
+    return "\n".join(parts)
+
+
+def _ai_data_summary_fast(conn, q):
+    """极速版数据摘要：本地引擎预筛候选菜，只把相关数据喂给模型（输入压缩到约1/4）"""
+    import ai_local
+    cn = ["一", "二", "三"]
+    candidates = ai_local.recommend(conn, q, limit=45)
+    if not candidates:
+        return _ai_data_summary(conn)
+
+    intro_map = {d["id"]: d["intro"] for d in
+                 conn.execute("SELECT id, intro FROM dishes WHERE status=1")}
+
+    # 本月榜单 Top10
+    board_rows = conn.execute("""
+        SELECT w.id, w.canteen, w.floor, w.name AS wname,
+               ROUND(AVG(r.score),2) AS a, COUNT(*) AS n
+        FROM ratings r JOIN windows w ON w.id=r.window_id
+        WHERE strftime('%Y-%m', r.date)=? GROUP BY w.id ORDER BY a DESC, n DESC LIMIT 10
+    """, (this_month(),)).fetchall()
+
+    # 只取候选窗口的评论（每窗口点赞最高的2条）
+    cand_wids = list({c["window_id"] for c in candidates if c.get("window_id")})
+    comments_by_win = {}
+    if cand_wids:
+        marks = ",".join("?" * len(cand_wids))
+        for p in conn.execute("""
+            SELECT p.window_id AS wid, p.content,
+                   (SELECT COUNT(*) FROM post_likes pl WHERE pl.post_id=p.id) AS likes
+            FROM posts p WHERE p.status=1 AND p.window_id IN (%s)
+        """ % marks, cand_wids):
+            comments_by_win.setdefault(p["wid"], []).append((p["content"], p["likes"]))
+        for wid in comments_by_win:
+            comments_by_win[wid].sort(key=lambda x: -x[1])
+
+    parts = ["【候选菜（已按与需求相关性初筛排序）】格式：菜名|窗口|位置|价格|评分|简介"]
+    for c in candidates:
+        intro = intro_map.get(c.get("dish_id"), "") or ""
+        parts.append("%s|%s|%s|¥%s|%s|%s" % (
+            c["dish"], c["window"], c["loc"], c["price"], c["score"], intro))
+    if board_rows:
+        parts.append("\n【本月榜单Top10】")
+        for i, b in enumerate(board_rows):
+            parts.append("%d.%s(%s食堂%d楼) 均分%s/%s人评" % (
+                i + 1, b["wname"], cn[b["canteen"] - 1], b["floor"], b["a"], b["n"]))
+    win_names = {c["window_id"]: (c["loc"], c["window"]) for c in candidates if c.get("window_id")}
+    if comments_by_win:
+        parts.append("\n【候选窗口学生评论精选】")
+        for wid, cs in comments_by_win.items():
+            loc, wname = win_names.get(wid, ("", ""))
+            joined = " / ".join("「%s」赞%d" % (c[:40], l) for c, l in cs[:2])
+            parts.append("%s%s：%s" % (loc, wname, joined))
+    return "\n".join(parts)
+
+
+def _ai_compact_prompt(conn, q, limit=12):
+    """极速提示词：只给最相关的 12 道候选，输出要求压到最短（约 400 字）。"""
+    import ai_local
+    cands = ai_local.recommend(conn, q, limit=limit)
+    if not cands:
+        return _ai_prompt(q, _ai_data_summary_fast(conn, q), fast=True)
+    lines = ["菜名|窗口|位置|价|评分"]
+    for c in cands:
+        lines.append("%s|%s|%s|%s|%s" % (
+            c["dish"], c["window"], c["loc"], c["price"], c.get("score") or "-"))
+    return ("从下列菜品里挑3个最适合「%s」的，只输出JSON数组：\n"
+            '[{"dish":"","window":"","loc":"","price":0,'
+            '"reason":"推荐理由20字内","intro":"菜品介绍30字内"}]\n%s'
+            % (q, "\n".join(lines)))
+
+
+def _ai_prompt(q, summary, fast=False):
+    """统一提示词：fast 模式带会话标题标记（桌面端会话列表一眼可辨）"""
+    head = ("你是校园食堂AI点菜助手。下面是本校食堂窗口的实时数据"
+            + ("（候选菜已由本地引擎按相关性初筛排序）" if fast else "")
+            + "。\n\n")
+    return (
+        head + summary +
+        "\n\n学生说：\"" + q + "\"\n"
+        "请综合学生需求、菜品特征、窗口评分、榜单排名和学生评论里的真实反馈"
+        "（分量/口味/排队/性价比等），推荐3个最合适的菜。\n"
+        "输出要求：第一行只输出「" + ("【AI点菜·极速】" if fast else "【AI点菜】") +
+        "」，第二行起只输出JSON数组，格式：\n"
+        '[{"dish":"菜名","window":"窗口名","loc":"几食堂几楼","price":11.0,'
+        '"score":4.7,"reason":"35字内推荐理由，评论里有佐证就引用评论关键词"}]\n'
+        "price/score 用数字，不要输出其他内容。"
+    )
+
+
+def _parse_ai_items(text):
+    """解析智能体返回的 JSON 推荐（容错：剥掉 markdown 围栏、抓第一个数组）"""
+    import json as _json
+    if not text:
+        return []
+    t = text.strip()
+    if "```" in t:  # 剥 markdown 围栏
+        t = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", t.strip(), flags=re.M).strip()
+    m = re.search(r"\[[\s\S]*\]", t)
+    if not m:
+        return []
+    try:
+        arr = _json.loads(m.group(0))
+    except Exception:
+        return []
+    items = []
+    if isinstance(arr, list):
+        for a in arr:
+            if not isinstance(a, dict):
+                continue
+            dish = str(a.get("dish") or a.get("name") or "").strip()
+            if not dish:
+                continue
+            items.append({
+                "dish": dish[:40],
+                "window": str(a.get("window") or "").strip()[:30],
+                "loc": str(a.get("loc") or "").strip()[:30],
+                "price": a.get("price") if isinstance(a.get("price"), (int, float)) else None,
+                "score": a.get("score") if isinstance(a.get("score"), (int, float)) else None,
+                "reason": str(a.get("reason") or "").strip()[:80],
+                "intro": str(a.get("intro") or "").strip()[:80],
+            })
+    return items[:3]
+
+
+def _attach_dish_info(conn, items):
+    """按菜名回查 dish_id/window_id/照片/介绍，前端可点击跳转窗口详情"""
+    for it in items:
+        row = conn.execute(
+            "SELECT d.id AS did, d.photo, d.intro, w.id AS wid FROM dishes d JOIN windows w ON w.id=d.window_id "
+            "WHERE d.name LIKE ? AND d.status=1 LIMIT 1", (it["dish"],)).fetchone()
+        if row:
+            it["dish_id"] = row["did"]
+            it["window_id"] = row["wid"]
+            if row["photo"]:
+                it["photo"] = row["photo"]
+            if not it.get("intro") and row["intro"]:
+                it["intro"] = row["intro"][:80]
+    return items
+
+
+def _ai_cloud_fast(q, summary, timeout=8):
+    """可选的云端快通道：配置 AI_API_BASE / AI_API_KEY 时走 OpenAI 兼容接口直连，
+    通常 2~5 秒返回；未配置或失败返回 None（由本地引擎兜底）。"""
+    import json as _json
+    import urllib.request
+    base = (os.environ.get("AI_API_BASE") or "").strip().rstrip("/")
+    key = (os.environ.get("AI_API_KEY") or "").strip()
+    if not base or not key:
+        return None
+    model = os.environ.get("AI_MODEL") or "deepseek-chat"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": _ai_prompt(q, summary, fast=True)}],
+        "temperature": 0.4,
+        "max_tokens": 600,
+        "stream": False,
+    }
+    req = urllib.request.Request(
+        base + "/chat/completions",
+        data=_json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + key},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            d = _json.loads(r.read().decode("utf-8"))
+        text = (d.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        return _parse_ai_items(text) or None
+    except Exception as e:
+        print("[ai] 云端快通道失败：%r" % e, flush=True)
+        return None
+
+
+@app.route("/api/ai/recommend", methods=["POST"])
+def api_ai_recommend():
+    """AI 点菜助手（同步版，兼容旧调用）：本地引擎秒回 + TeleAgent 智能体结果"""
+    data = request.get_json(force=True, silent=True) or {}
+    q = (data.get("q") or "").strip()
+    if not q or len(q) > 60:
+        return err("用一句话说说你想吃什么（60 字内）")
+
+    engine, items = None, []
+
+    # 1) TeleAgent 桥（仅 Windows 本机且桌面端在运行时可用；极速版压缩输入）
+    try:
+        import teleagent_client
+        if teleagent_client.available():
+            with get_db() as c:
+                summary = _ai_data_summary_fast(c, q)
+            prompt = _ai_prompt(q, summary, fast=True)
+            answer = teleagent_client.ask(prompt, timeout=150)
+            items = _parse_ai_items(answer)
+            if items:
+                engine = "teleagent"
+    except Exception as e:
+        print("[ai] TeleAgent 桥接异常：%r" % e, flush=True)
+        items = []
+
+    # 2) 本地标签引擎兜底（离线可用）
+    if not items:
+        import ai_local
+        with get_db() as c:
+            items = ai_local.recommend(c, q)
+        engine = "local"
+    elif engine == "teleagent":
+        with get_db() as c:
+            items = _attach_dish_info(c, items)
+
+    if not items:
+        return err("暂时没推出来，换个说法试试（比如「想吃点凉的」）")
+    return ok({"q": q, "engine": engine, "items": items})
+
+
+# ---------------------------------------------------------------- AI 点菜助手 · 极速版（先秒回后升级）
+import threading
+
+_AI_JOBS = {}          # job_id -> {status, items, error, q, ts}
+_AI_JOB_SEQ = [0]
+_AI_JOB_LOCK = threading.Lock()
+
+
+def _run_teleagent_job(job_id, q):
+    """后台线程：调 TeleAgent 智能体（极速模式：本地预筛压缩输入），结果写回 _AI_JOBS"""
+    try:
+        import teleagent_client
+        with get_db() as c:
+            summary = _ai_data_summary_fast(c, q)
+        prompt = _ai_prompt(q, summary, fast=True)
+        answer = teleagent_client.ask(prompt, timeout=150)
+        items = _parse_ai_items(answer)
+        if items:
+            with get_db() as c:
+                items = _attach_dish_info(c, items)
+            _AI_JOBS[job_id].update(status="done", items=items, engine="teleagent")
+        else:
+            _AI_JOBS[job_id].update(status="failed", error="模型没返回有效结果")
+    except Exception as e:
+        if job_id in _AI_JOBS:
+            _AI_JOBS[job_id].update(status="failed", error="模型调用失败")
+        print("[ai] 后台任务异常：%r" % e, flush=True)
+    finally:
+        # 清理超过 10 分钟的旧任务，防内存膨胀
+        with _AI_JOB_LOCK:
+            cutoff = datetime.now(CN_TZ).timestamp() - 600
+            for k in [k for k, v in _AI_JOBS.items() if v["ts"] < cutoff]:
+                _AI_JOBS.pop(k, None)
+
+
+def _run_engine_job(job_id, prompt):
+    """后台线程：走 4397 引擎直连（约 4 秒），结果写回 _AI_JOBS"""
+    try:
+        import teleagent_client
+        model = os.environ.get("AI_ENGINE_MODEL", "chat-lite")
+        answer = teleagent_client.engine_ask(prompt, model=model, timeout=12)
+        items = _parse_ai_items(answer)
+        if items:
+            with get_db() as c:
+                items = _attach_dish_info(c, items)
+            _AI_JOBS[job_id].update(status="done", items=items, engine="engine")
+        else:
+            _AI_JOBS[job_id].update(status="failed", error="模型没返回有效结果")
+    except Exception as e:
+        if job_id in _AI_JOBS:
+            _AI_JOBS[job_id].update(status="failed", error="引擎调用失败")
+        print("[ai] 引擎任务异常：%r" % e, flush=True)
+    finally:
+        with _AI_JOB_LOCK:
+            cutoff = datetime.now(CN_TZ).timestamp() - 600
+            for k in [k for k, v in _AI_JOBS.items() if v["ts"] < cutoff]:
+                _AI_JOBS.pop(k, None)
+
+
+@app.route("/api/ai/quick", methods=["POST"])
+def api_ai_quick():
+    """AI 点菜：本地引擎秒回 + 4397 引擎直连后台升级（约 4 秒）。
+    引擎不可用时退回调度器（约 40 秒）或纯本地。"""
+    data = request.get_json(force=True, silent=True) or {}
+    q = (data.get("q") or "").strip()
+    if not q or len(q) > 60:
+        return err("用一句话说说你想吃什么（60 字内）")
+
+    import ai_local
+    with get_db() as c:
+        local_items = ai_local.recommend(c, q)
+    if not local_items:
+        return err("暂时没推出来，换个说法试试（比如「想吃点凉的」）")
+
+    # 1) 云端快通道（可选，默认关闭）
+    try:
+        with get_db() as c:
+            summary = _ai_data_summary_fast(c, q)
+        cloud = _ai_cloud_fast(q, summary, timeout=8)
+        if cloud:
+            with get_db() as c:
+                cloud = _attach_dish_info(c, cloud)
+            return ok({"q": q, "engine": "cloud", "items": cloud,
+                       "job_id": None, "upgrading": False, "can_upgrade": False})
+    except Exception as e:
+        print("[ai] 云端快通道异常：%r" % e, flush=True)
+
+    # 2) 引擎直连（4~14 秒）：后台跑，前端轮询升级
+    job_id = None
+    try:
+        import teleagent_client
+        if teleagent_client.engine_available():
+            with get_db() as c:
+                prompt = _ai_compact_prompt(c, q)
+            with _AI_JOB_LOCK:
+                _AI_JOB_SEQ[0] += 1
+                job_id = "aijob-%d-%s" % (_AI_JOB_SEQ[0], secrets.token_hex(4))
+                _AI_JOBS[job_id] = {"status": "running", "items": None, "error": None,
+                                    "q": q, "ts": datetime.now(CN_TZ).timestamp()}
+            threading.Thread(target=_run_engine_job, args=(job_id, prompt), daemon=True).start()
+    except Exception as e:
+        print("[ai] 引擎任务启动失败：%r" % e, flush=True)
+
+    return ok({"q": q, "engine": "local", "items": local_items,
+               "job_id": job_id, "upgrading": bool(job_id), "can_upgrade": False})
+
+
+@app.route("/api/ai/upgrade", methods=["POST"])
+def api_ai_upgrade():
+    """手动触发深度分析：优先引擎直连（约 4 秒），否则调度器（约 40 秒）。"""
+    data = request.get_json(force=True, silent=True) or {}
+    q = (data.get("q") or "").strip()
+    if not q or len(q) > 60:
+        return err("参数错误")
+    try:
+        import teleagent_client
+        engine_ok = teleagent_client.engine_available()
+        sched_ok = teleagent_client.available()
+    except Exception:
+        engine_ok = sched_ok = False
+    if not engine_ok and not sched_ok:
+        return err("本机 TeleAgent 未运行，无法深度分析")
+    with _AI_JOB_LOCK:
+        _AI_JOB_SEQ[0] += 1
+        job_id = "aijob-%d-%s" % (_AI_JOB_SEQ[0], secrets.token_hex(4))
+        _AI_JOBS[job_id] = {"status": "running", "items": None, "error": None,
+                            "q": q, "ts": datetime.now(CN_TZ).timestamp()}
+    if engine_ok:
+        with get_db() as c:
+            prompt = _ai_compact_prompt(c, q)
+        threading.Thread(target=_run_engine_job, args=(job_id, prompt), daemon=True).start()
+    else:
+        threading.Thread(target=_run_teleagent_job, args=(job_id, q), daemon=True).start()
+    return ok({"job_id": job_id})
+
+
+@app.route("/api/ai/stream", methods=["POST"])
+def api_ai_stream():
+    """流式版：SSE 推送本地结果 + 引擎正文 delta + 最终结构化推荐（含理由/介绍）。"""
+    data = request.get_json(force=True, silent=True) or {}
+    q = (data.get("q") or "").strip()
+    if not q or len(q) > 60:
+        return err("用一句话说说你想吃什么（60 字内）")
+
+    import ai_local
+    import teleagent_client
+    with get_db() as c:
+        local_items = ai_local.recommend(c, q)
+        prompt = _ai_compact_prompt(c, q)
+    if not local_items:
+        return err("暂时没推出来，换个说法试试（比如「想吃点凉的」）")
+
+    def gen():
+        import json as _json
+
+        def send(evt, payload):
+            return "event: %s\ndata: %s\n\n" % (evt, _json.dumps(payload, ensure_ascii=False))
+
+        yield send("local", {"items": local_items})
+        if not teleagent_client.engine_available():
+            print("[ai] stream: engine unavailable", flush=True)
+            yield send("done", {"items": local_items, "engine": "local"})
+            return
+        buf = ""
+        model = os.environ.get("AI_ENGINE_MODEL", "chat-lite")
+        for chunk in teleagent_client.engine_stream(prompt, model=model, timeout=12):
+            if chunk["type"] == "delta":
+                if chunk.get("part") == "text":
+                    buf += chunk["text"]
+                yield send("delta", {"text": chunk["text"], "part": chunk.get("part")})
+            elif chunk["type"] == "error":
+                print("[ai] stream error: %s" % chunk.get("message"), flush=True)
+                yield send("done", {"items": local_items, "engine": "local",
+                                    "note": chunk.get("message")})
+                return
+            elif chunk["type"] == "done":
+                full = chunk.get("full") or buf
+                items = _parse_ai_items(full)
+                print("[ai] stream done: full=%d items=%d" % (len(full), len(items)), flush=True)
+                if items:
+                    with get_db() as c:
+                        items = _attach_dish_info(c, items)
+                    yield send("done", {"items": items, "engine": "engine"})
+                else:
+                    yield send("done", {"items": local_items, "engine": "local"})
+                return
+
+    return Response(gen(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache",
+                             "X-Accel-Buffering": "no",
+                             "Connection": "keep-alive"})
+
+
+@app.route("/api/ai/status/<job_id>")
+def api_ai_status(job_id):
+    """极速版第 2 步：轮询后台大模型任务结果"""
+    job = _AI_JOBS.get(job_id)
+    if not job:
+        return err("任务不存在或已过期", 404)
+    return ok({"status": job["status"], "engine": job.get("engine"),
+               "items": job.get("items"), "error": job.get("error"), "q": job.get("q")})
+
+
 @app.route("/api/merchant/overview")
 @require_merchant
 def api_merchant_overview():

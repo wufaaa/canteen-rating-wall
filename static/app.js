@@ -69,6 +69,8 @@ const ICONS = {
   award: '<circle cx="12" cy="8" r="6"/><path d="M15.477 12.89 17 22l-5-3-5 3 1.523-9.11"/>',
   camera: '<path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3Z"/><circle cx="12" cy="13" r="3"/>',
   search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+  sparkles: '<path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/><path d="M20 3v4"/><path d="M22 5h-4"/><path d="M4 17v2"/><path d="M5 18H3"/>',
+  cpu: '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/>',
 };
 function icon(name, cls) { return `<svg class="ic ${cls || ""}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[name] || ""}</svg>`; }
 
@@ -909,6 +911,205 @@ function route() {
   window.scrollTo(0, 0);
 }
 
+/* ------------------------------------------------------------ AI 点菜助手 */
+const AI_CHIPS = [
+  "今天有点热，想吃点凉的",
+  "想吃辣的过过瘾",
+  "没胃口，吃点开胃的",
+  "减肥期，想吃低卡的",
+  "穷学生，10块钱吃啥",
+  "宵夜走起",
+];
+const AI_TIPS = ["星辰正在翻评分和评论…", "看看本月榜单谁在前列…", "学生评论里找口碑线索…", "快好了，正在排序…"];
+
+function openAiBox() {
+  modal(`
+    <h3>${icon("sparkles")} AI 点菜助手</h3>
+    <div class="m-sub">一句话说你现在想吃啥，结合评分、评论、榜单帮你点菜（由本机星辰大模型驱动）</div>
+    <div class="ai-form">
+      <input id="aiQ" maxlength="60" placeholder="比如：今天有点热，想吃点凉的">
+      <button class="btn btn-primary" data-act="ai-ask">${icon("send")} 问问</button>
+    </div>
+    <div class="ai-chips">${AI_CHIPS.map(c =>
+      `<button class="ai-chip" data-act="ai-chip" data-q="${esc(c)}">${esc(c)}</button>`).join("")}</div>
+    <div id="aiResult"></div>
+  `);
+  const inp = $("#aiQ");
+  inp.addEventListener("keydown", e => { if (e.key === "Enter") askAi(); });
+}
+
+function aiCardsHtml(items, t0) {
+  return items.map((it, i) => `
+      <div class="ai-card ${it.window_id ? "clickable" : ""}" ${it.window_id ? `data-act="go-window" data-id="${it.window_id}"` : ""}>
+        <div class="ai-rank">${i + 1}</div>
+        <div class="ai-main">
+          <div class="ai-dish">${esc(it.dish)}<span class="ai-price">¥${it.price != null ? it.price : "-"}</span></div>
+          <div class="ai-meta">${esc(it.window)} · ${esc(it.loc)}${it.score != null ? ` · 评分 ${it.score}` : ""}</div>
+          <div class="ai-reason">${esc(it.reason)}</div>
+          ${it.intro ? `<div class="ai-intro">${esc(it.intro)}</div>` : ""}
+        </div>
+      </div>`).join("");
+}
+
+function aiBadgeHtml(engine) {
+  if (engine === "teleagent" || engine === "engine") return `<span class="ai-badge ai-badge-star">${icon("sparkles")} 大模型</span>`;
+  if (engine === "cloud") return `<span class="ai-badge ai-badge-star">${icon("sparkles")} 云端大模型</span>`;
+  return `<span class="ai-badge">${icon("cpu")} 本地智能推荐</span>`;
+}
+
+async function askAi(preset) {
+  const inp = $("#aiQ");
+  const q = (preset || (inp ? inp.value : "") || "").trim();
+  if (!q) { toast("先说说你想吃点啥", "err"); if (inp) inp.focus(); return; }
+  if (inp) inp.value = q;
+  const box = $("#aiResult");
+  if (!box) return;
+
+  box.innerHTML = `<div class="ai-loading">
+    <div class="ai-spin">${icon("sparkles")}</div>
+    <div class="ai-load-text"><b>${esc(q)}</b><span>正在秒查评分/评论/榜单…</span></div>
+  </div>`;
+
+  const t0 = performance.now();
+  let resp;
+  try {
+    resp = await fetch("/api/ai/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ q }),
+    });
+  } catch (e) {
+    box.innerHTML = `<div class="ai-error">${icon("alert")} 网络异常，请重试</div>`;
+    return;
+  }
+  if (!resp.ok || !resp.body) {
+    box.innerHTML = `<div class="ai-error">${icon("alert")} 推荐失败，请重试</div>`;
+    return;
+  }
+
+  let localShown = false, reasoning = "", text = "", textStarted = false;
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!box.isConnected) { try { reader.cancel(); } catch (e) {} return; }
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const em = frame.match(/^event: (.+)$/m);
+        const dm = frame.match(/^data: ([\s\S]+)$/m);
+        if (!em || !dm) continue;
+        let data;
+        try { data = JSON.parse(dm[1]); } catch (e) { continue; }
+        const ev = em[1];
+
+        if (ev === "local" && !localShown && data.items) {
+          localShown = true;
+          const sec = Math.max(1, Math.round((performance.now() - t0) / 1000));
+          box.innerHTML = `<div class="ai-done">${aiBadgeHtml("local")}<span class="ai-sec">${sec}s</span></div>` +
+            aiCardsHtml(data.items) +
+            `<div class="ai-upgrading" id="aiUpgrading">
+               <div class="ai-up-spin">${icon("sparkles")}</div>
+               <div class="ai-up-text" style="flex:1;min-width:0">
+                 <b>AI 正在结合评分/评论/榜单生成推荐…</b>
+                 <div class="ai-stream is-think" id="aiStream"></div>
+               </div>
+             </div>`;
+        } else if (ev === "delta") {
+          if (data.part === "reasoning") {
+            reasoning += data.text;
+            const el = $("#aiStream");
+            if (el) {
+              el.textContent = reasoning.slice(-500);
+              el.scrollTop = el.scrollHeight;
+            }
+          } else {
+            if (!textStarted) {
+              textStarted = true;
+              const el = $("#aiStream");
+              if (el) el.textContent = "正在整理推荐…";
+            }
+            text += data.text;
+          }
+        } else if (ev === "done") {
+          const sec = Math.max(1, Math.round((performance.now() - t0) / 1000));
+          const eng = data.engine || "local";
+          const items = data.items || [];
+          if (eng === "engine" && items.length) {
+            box.innerHTML = `<div class="ai-done">${aiBadgeHtml("engine")}<span class="ai-upgraded">${icon("sparkles")} 已升级</span><span class="ai-sec">${sec}s</span></div>` +
+              aiCardsHtml(items) +
+              `<div class="ai-foot">${icon("sparkles")} 大模型结合评分、评论、榜单的深度推荐</div>`;
+          } else if (items.length) {
+            box.innerHTML = `<div class="ai-done">${aiBadgeHtml(eng)}<span class="ai-sec">${sec}s</span></div>` +
+              aiCardsHtml(items) +
+              `<div class="ai-foot">${icon("cpu")} 本机推荐引擎（结合评分、评论、榜单，离线可用）</div>`;
+          }
+        }
+      }
+    }
+  } catch (e) {
+    /* 流中断，保留已渲染内容 */
+  }
+}
+
+async function startAiUpgrade(btn) {
+  const q = (btn && btn.dataset.q) || "";
+  const box = $("#aiResult");
+  if (!q || !box) return;
+  btn.disabled = true;
+  const old = box.querySelector(".ai-upgrade-btn");
+  if (old) old.remove();
+
+  const bar = document.createElement("div");
+  bar.className = "ai-upgrading";
+  bar.id = "aiUpgrading";
+  bar.innerHTML = `<div class="ai-up-spin">${icon("sparkles")}</div>
+    <div class="ai-up-text"><b>星辰大模型正在深度分析评分/评论/榜单…</b>
+    <span id="aiUpTip">${AI_TIPS[0]}</span><em id="aiUpTimer">0s</em></div>`;
+  box.appendChild(bar);
+
+  let r;
+  try { r = await api("/api/ai/upgrade", "POST", { q }); }
+  catch (e) { r = { ok: false, msg: "网络异常" }; }
+  if (!r.ok) {
+    bar.innerHTML = `<div class="ai-up-fail">${icon("info")} ${esc(r.msg || "无法深度分析")}</div>`;
+    return;
+  }
+  const jobId = r.data.job_id;
+  let tipI = 0, sec = 0;
+  const timer = setInterval(() => {
+    sec += 1;
+    const t = $("#aiUpTip"), m = $("#aiUpTimer");
+    if (t && sec % 5 === 0) t.textContent = AI_TIPS[++tipI % AI_TIPS.length];
+    if (m) m.textContent = sec + "s";
+  }, 1000);
+
+  const poll = async () => {
+    if (!box.isConnected) { clearInterval(timer); return; }
+    let s;
+    try { s = await api("/api/ai/status/" + jobId); }
+    catch (e) { clearInterval(timer); return; }
+    if (!s.ok || !box.isConnected) { clearInterval(timer); return; }
+    const st = s.data;
+    if (st.status === "running") { setTimeout(poll, 1500); return; }
+    clearInterval(timer);
+    if (st.status === "done" && st.items && st.items.length) {
+      box.innerHTML = `<div class="ai-done">${aiBadgeHtml("teleagent")}<span class="ai-upgraded">${icon("sparkles")} 已升级</span><span class="ai-sec">${sec}s</span></div>` +
+        aiCardsHtml(st.items) +
+        `<div class="ai-foot">${icon("sparkles")} 星辰大模型结合评分、评论、榜单的深度推荐</div>`;
+    } else {
+      const up = $("#aiUpgrading");
+      if (up) up.innerHTML = `<div class="ai-up-fail">${icon("info")} 深度分析未完成，以上为本地推荐结果</div>`;
+    }
+  };
+  setTimeout(poll, 1500);
+}
+
 /* ------------------------------------------------------------ 事件分发 */
 document.addEventListener("click", async e => {
   const el = e.target.closest("[data-act]");
@@ -919,8 +1120,12 @@ document.addEventListener("click", async e => {
     case "modal-close": closeModal(); break;
     case "confirm-cancel": closeModal(); App._cf(false); break;
     case "confirm-ok": closeModal(); App._cf(true); break;
-    case "go-window": location.hash = "#/window/" + id; break;
-    case "go-canteens": location.hash = "#/canteens"; break;
+    case "go-window": closeModal(); location.hash = "#/window/" + id; break;
+    case "go-canteens": closeModal(); location.hash = "#/canteens"; break;
+    case "ai-open": openAiBox(); break;
+    case "ai-ask": askAi(); break;
+    case "ai-chip": askAi(el.dataset.q); break;
+    case "ai-upgrade": startAiUpgrade(el); break;
     case "sel-canteen": S.winSel.canteen = +v; renderCanteens(); break;
     case "sel-floor": S.winSel.floor = +v; renderCanteens(); break;
     case "search-clear": {

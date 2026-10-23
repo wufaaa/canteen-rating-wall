@@ -6,6 +6,7 @@
 
 ## ✨ 功能特性
 
+- **AI 点菜助手**：一句话说想吃啥（如「今天有点热，想吃点凉的」），由本机 TeleAgent 引擎结合菜品、评分、月榜和学生评论推荐，每道菜带**推荐理由**和**菜品介绍**；结果**流式输出**（推理过程实时滚动），通常 4~10 秒。桌面端未运行时自动切换离线标签引擎兜底，功能永不掉线。数据每次实时查库，商家改菜、学生新发评论，下一次提问立刻生效。
 - **C 位榜单**：按当月平均分实时排名，第一名独占一张大卡片，其余分两列展示，一屏看完 30+ 个窗口。
 - **月度海报区**：自动取出上月第一名，生成可直接转发到班级群 / 朋友圈的「月度最佳窗口」海报。
 - **匿名打分**：学生免注册，系统自动分配一个随机昵称；每人每天最多打 3 次分，防刷分。
@@ -24,6 +25,7 @@
 | 后端 | Python 3 + Flask |
 | 数据库 | SQLite（WAL 模式，自带并发保护） |
 | 前端 | 原生 HTML / CSS / JavaScript（无框架、无打包） |
+| AI 推理 | 本机 TeleAgent 引擎直连（`127.0.0.1:4397`，OpenCode 兼容 API + SSE 流式） + 离线标签引擎兜底 |
 | 部署 | 任意支持 Python 的环境；也可一键发布到云端 |
 
 ---
@@ -66,20 +68,22 @@ python app.py
 
 ```
 canteen/
-├── app.py              # Flask 后端：接口、鉴权、页面路由
-├── database.py         # 建库、种子数据、时间/时区工具
-├── static/             # 前端（无构建）
+├── app.py                # Flask 后端：接口、鉴权、页面路由、AI 推荐接口
+├── teleagent_client.py   # TeleAgent 桥接：调本机桌面端智能体（仅 Windows）
+├── ai_local.py           # 离线标签推荐引擎（兜底，跨平台）
+├── database.py           # 建库、种子数据、时间/时区工具
+├── static/               # 前端（无构建）
 │   ├── index.html
 │   ├── app.js
 │   └── style.css
-├── uploads/            # 演示菜品图与帖子配图（已随仓库提供）
-├── tool.py             # 版本管理：save / rollback / db 快照
+├── uploads/              # 演示菜品图与帖子配图（已随仓库提供）
+├── tool.py               # 版本管理：save / rollback / db 快照
 ├── requirements.txt
-├── start.bat           # Windows 一键启动
+├── start.bat             # Windows 一键启动
 └── README.md
 ```
 
-`canteen.db`、`secret.key`、`backups/` 均**不入库**——数据库由 `database.py` 自动初始化，密钥每台机器自行生成。
+`canteen.db` 随仓库提供（含演示数据，开箱即用）；`secret.key`、`backups/` 不入库——密钥每台机器自行生成。
 
 ---
 
@@ -112,6 +116,8 @@ python tool.py dbrestore db-xxx.db   # 恢复某份数据库
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/api/auth/login` | 学生 / 商家 / 管理员登录 |
+| POST | `/api/ai/stream` | AI 点菜（SSE 流式）：本地秒回 + 引擎流式 + 最终结构化推荐 |
+| POST | `/api/ai/quick` | AI 点菜（非流式）：本地秒回 + 后台升级任务 |
 | GET  | `/api/leaderboard` | 当月榜单 + 上月第一名 |
 | GET  | `/api/windows` | 窗口列表 |
 | GET  | `/api/windows/<id>` | 窗口详情与菜品 |
@@ -121,6 +127,37 @@ python tool.py dbrestore db-xxx.db   # 恢复某份数据库
 | POST | `/api/posts/<id>/like` | 点赞 |
 | POST | `/api/posts/<id>/report` | 举报 |
 | 管理员 / 商家 | `/api/admin/*`、`/api/merchant/*` | 后台管理 |
+
+---
+
+## 🤖 AI 点菜助手工作原理
+
+学生输入一句话后，后端按以下优先级给出推荐：
+
+1. **TeleAgent 引擎直连（首选，仅 Windows 本机）**
+   `teleagent_client.py` 连接 TeleAgent 桌面端内置的 OpenCode 兼容引擎（`127.0.0.1:4397`），
+   用 `POST /session/{id}/message` 同步执行，并订阅 `GET /event` 的 SSE 事件流取回正文。
+   - **免配置**：引擎凭据（Basic + `local-v1` HMAC 签名）由桌面端注入子进程环境变量，
+     代码从进程内存自动发现，不落盘、不上传、不需要 API Key。
+   - **流式**：推理过程与正文分段返回，前端边收边渲染，2 秒内就有文字在动。
+   - **耗时**：实测 4~10 秒（模型档位默认 `chat-lite`，可用环境变量 `AI_ENGINE_MODEL` 调整）。
+   - **要求**：Windows + 已安装并登录、运行 TeleAgent 桌面端。
+2. **调度器投递（兜底）**：引擎不可用但桌面端在跑时，改用调度器 HTTP API 投递任务，约 40 秒返回。
+3. **离线标签引擎（最终兜底，跨平台）**：`ai_local.py` 对 180 道菜打温度/口味/场景/价位
+   多维标签，把学生的话解析成意图标签，结合窗口评分、月榜排名与学生评论口碑
+   （好评/差评关键词 + 意图佐证）综合打分取 Top3，**1 秒内**响应。
+
+响应中的 `engine` 字段标明本次推荐由哪个引擎生成（`engine` / `teleagent` / `local`），
+前端徽章如实展示。
+
+**自检**：
+
+```bash
+python teleagent_client.py "请只回复四个字：桥接正常"
+```
+
+**没有 TeleAgent 也能用**：直接 `python app.py`，AI 点菜会自动走本地标签引擎，
+其余功能（打分、发帖、榜单、搜索）完全不受影响。
 
 ---
 
