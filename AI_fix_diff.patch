@@ -1,0 +1,1055 @@
+--- a/ai_local.py	2026-10-24 17:47:33.422873900 +0800
++++ b/ai_local.py	2026-10-24 14:54:14.334743600 +0800
+@@ -7,13 +7,28 @@
+ import re
+ import sqlite3
+ 
+-CN = ["一", "二", "三"]
++# 食堂序号 -> 中文名。不再写死 3 个：库里已经有 4 个食堂，
++# 原来 CN[r["canteen"]-1] 在第 4 食堂直接 IndexError，把 /api/ai/stream 打成 500。
++CANTEEN_NAMES = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
++CN = CANTEEN_NAMES  # 兼容旧引用
++
++
++def canteen_name(n):
++    """食堂序号转中文名；超出已知范围退回阿拉伯数字，任何输入都不抛异常。"""
++    try:
++        n = int(n)
++    except (TypeError, ValueError):
++        return "食堂"
++    if 1 <= n <= len(CANTEEN_NAMES):
++        return CANTEEN_NAMES[n - 1]
++    return "%d" % n
+ 
+ # ------------------------------------------------------------ 意图词典：口语 -> 标签
+ INTENT_RULES = [
+     # (正则, 命中后要求的标签集合/排除的标签集合)
+-    (r"热|暑|降温|凉快|冰|清爽|解腻|渴", {"temp": "cool"}),
+-    (r"冷|寒|暖|胃寒|降温后|冬天|下雪|冻", {"temp": "hot"}),
++    # 「天热」是要凉的，「想吃热的」是要热的 —— 不能都按「热」字一刀切
++    (r"天热|好热|太热|有点热|热死|暑|降温|凉|冰|清爽|解腻|渴", {"temp": "cool"}),
++    (r"冷|寒|暖|胃寒|冬天|下雪|冻|想吃热|来点热|热的|热乎|热汤|热面", {"temp": "hot"}),
+     (r"辣|无辣不欢|过瘾|麻辣|香辣|变态辣", {"taste": "spicy"}),
+     (r"清淡|油腻|腻|不想油|少油|养生|清淡点", {"taste": "light"}),
+     (r"甜|甜品|糖水|解馋|下午茶|奶茶", {"taste": "sweet"}),
+@@ -25,6 +40,7 @@
+     (r"穷|没钱|吃土|便宜|省钱|穷吃|特价|低消", {"scene": "cheap"}),
+     (r"请客|聚餐|改善|犒劳|庆祝|生日", {"scene": "rich"}),
+     (r"面|粉|拉面|米线|嗦", {"cat": "noodle"}),
++    (r"饺子|水饺|蒸饺|煎饺|锅贴|馄饨|饨|盒子|包子|烧麦", {"cat": "dumpling"}),
+     (r"饭|盖浇|拌饭|炒饭", {"cat": "rice"}),
+     (r"汤|粥|喝的|暖汤", {"cat": "soup"}),
+     (r"肉|吃肉|牛肉|鸡肉|羊肉|猪肉|荤", {"cat": "meat"}),
+@@ -54,7 +70,9 @@
+     # breakfast：适合早餐
+     (r"粥|包子|豆浆|油条|吐司|贝果|咖啡|牛奶|肠粉|早点|蒸饺|小笼|生煎|手抓饼|蛋饼|蛋酒|热干面|汤包|点心", "scene", "breakfast"),
+     # noodle：面食粉类
+-    (r"面|粉|米线|拉面|热干|螺蛳|馄饨|饺子|河粉|肠粉|拌面|炒面|泡馍|宽粉", "cat", "noodle"),
++    (r"面|粉|米线|拉面|热干|螺蛳|馄饨|饨|饺子|饺|河粉|肠粉|拌面|炒面|泡馍|宽粉", "cat", "noodle"),
++    # dumpling：饺子面点（和面食分开，避免「想吃饺子」推出一堆米粉）
++    (r"饺子|水饺|蒸饺|煎饺|锅贴|馄饨|饨|盒子|包子|烧麦|饺", "cat", "dumpling"),
+     # rice：米饭类
+     (r"饭|盖浇|拌饭|炒饭|卤肉饭|猪脚饭|蛋包饭|套餐|黄焖|烧腊|烧味|叉烧", "cat", "rice"),
+     # soup：汤粥类
+@@ -70,6 +88,8 @@
+     "sweet": "甜蜜解馋", "sour": "酸爽开胃", "filling": "管饱扛饿", "diet": "轻食低卡",
+     "latenight": "适合宵夜", "breakfast": "适合早餐", "cheap": "高性价比", "rich": "犒劳一下",
+     "noodle": "面食", "rice": "米饭", "soup": "汤粥", "meat": "肉食", "veggie": "素食",
++    "dumpling": "饺子面点",
++    "high_protein": "高蛋白",
+ }
+ 
+ # ------------------------------------------------------------ 评论信号（实时读帖）
+@@ -97,6 +117,34 @@
+ }
+ 
+ 
++# ------------------------------------------------------------ 差评归类（避雷）
++# 只对已经命中 COMMENT_BAD 的帖子做归类，避免「分量超足」被误判成「分量少」
++WARN_RULES = [
++    (r"排队|队伍|等(了|快)|人多|挤", "排队久"),
++    (r"分量|量少|没给够|少得|太少|缩水|对付一口", "分量偏少"),
++    (r"咸|淡|油放|腻|没味|寡淡", "口味不稳"),
++    (r"贵|涨价|不值|性价比低", "价格偏高"),
++    (r"卖完|没了|售罄", "容易售罄"),
++    (r"凉了|温的|不热|凉透", "出餐偏凉"),
++    (r"态度|爱答不理|脸色", "服务一般"),
++]
++
++
++def window_warnings(conn):
++    """按窗口汇总差评标签 -> {window_id: [tag, ...]}（确定性规则，不经过模型）"""
++    out = {}
++    for p in conn.execute("SELECT window_id, content FROM posts WHERE status=1"):
++        text = p["content"] or ""
++        if not any(k in text for k in COMMENT_BAD):
++            continue
++        for pat, tag in WARN_RULES:
++            if re.search(pat, text):
++                bucket = out.setdefault(p["window_id"], [])
++                if tag not in bucket:
++                    bucket.append(tag)
++    return out
++
++
+ def _comment_signals(conn, intent):
+     """每窗口：评论口碑分（好评-差评）+ 评论对当前意图的关键词佐证"""
+     posts_by_win = {}
+@@ -122,6 +170,9 @@
+     for pat, dim, val in DISH_TAG_RULES:
+         if re.search(pat, blob):
+             tags.setdefault(dim, set()).add(val)
++    # 高蛋白只认菜名/简介里的食材证据，不拿窗口名凑
++    if PROTEIN_DISH.search("%s %s" % (name, intro)):
++        tags.setdefault("nutrition", set()).add("high_protein")
+     if price <= 10:
+         tags.setdefault("scene", set()).add("cheap")
+     if price >= 18:
+@@ -129,15 +180,32 @@
+     return tags
+ 
+ 
++# ------------------------------------------------------------ 否定词与高蛋白
++# 「不辣」「不要辣」「少辣」「微辣」里的「辣」会被 INTENT_RULES 的 /辣/ 命中，
++# 结果学生说「不辣」反而推麻辣豆腐。所以先剥离否定短语，再解析意图。
++NEG_SPICY = re.compile(r"(不|不要|别|少|微|没|无)\s*辣")
++
++# 高蛋白必须有食材证据，不能只靠 scene:diet 软加分
++PROTEIN_DISH = re.compile(
++    r"鸡胸|鸡腿|鸡排|鸡块|牛肉|牛腩|肥牛|羊肉|里脊|瘦肉|排骨|猪蹄|鱼|虾|蟹|"
++    r"蛋(?!糕)|豆腐|豆干|豆皮|腐竹|牛奶|酸奶|鸡|鸭|鹅|肉")
++
++
+ def parse_intent(q):
+     """把学生的话解析成意图标签 dict{dim: set(val)}"""
+     intent = {}
++    avoid_spicy = bool(NEG_SPICY.search(q))
++    q2 = NEG_SPICY.sub(" ", q)          # 先把「不辣」整段从原句拿掉
+     for pat, want in INTENT_RULES:
+-        if re.search(pat, q):
++        if re.search(pat, q2):
+             for dim, val in want.items():
+                 intent.setdefault(dim, set()).add(val)
++    if avoid_spicy:
++        intent["avoid_spicy"] = {True}
++    if PROTEIN_DISH.search(q2) or re.search(r"高蛋白|增肌|健身|补蛋白", q2):
++        intent.setdefault("nutrition", set()).add("high_protein")
+     # 数字预算：「10块」「15元」「20块钱」→ budget
+-    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:块|元)", q)
++    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:块|元)", q2)
+     if m:
+         try:
+             intent["budget"] = {float(m.group(1))}
+@@ -152,10 +220,22 @@
+     matched = []
+     missed = 0
+     budget = None
++    # 硬约束：说「不辣」就不能出现辣菜（哪怕同时说了「麻辣」也以不辣优先）
++    if intent.get("avoid_spicy") and "spicy" in dish_tags.get("taste", set()):
++        return -999, []
+     for dim, want_vals in intent.items():
+         if dim == "budget":
+             budget = min(want_vals)
+             continue
++        if dim == "avoid_spicy":
++            continue                    # 已在上面做硬过滤，不参与加分
++        if dim == "nutrition":
++            if want_vals & dish_tags.get("nutrition", set()):
++                s += 30
++                matched.append("高蛋白")
++            else:
++                missed += 1
++            continue
+         got = dish_tags.get(dim, set())
+         hit = want_vals & got
+         if hit:
+@@ -186,12 +266,32 @@
+     return s, matched
+ 
+ 
++STOP_GRAMS = {"想吃", "来份", "来个", "想要", "吃点", "有点", "一份", "今天", "什么",
++              "推荐", "帮我", "现在", "一些", "我想", "觉得", "可以", "一点", "的话"}
++
++
++def _name_hit(q, bare):
++    """学生话里有没有直接点名这道菜；返回命中片段长度（9=整名命中，0=没命中）"""
++    if len(bare) >= 2 and bare in q:
++        return 9
++    best = 0
++    for n in (3, 2):
++        for i in range(len(q) - n + 1):
++            seg = q[i:i + n]
++            if seg in STOP_GRAMS:
++                continue
++            if seg in bare:
++                best = max(best, n)
++    return best
++
++
+ def recommend(conn, q, limit=3):
+     """主入口：conn 为食堂 sqlite 连接；返回推荐列表（与 AI 输出同构）
+ 
+     数据每次实时查库：菜品/价格/评分/月榜/学生评论。"""
+     intent = parse_intent(q)
+     win_comment = _comment_signals(conn, intent)
++    warns = window_warnings(conn)
+     rows = conn.execute("""
+         SELECT w.id AS wid, w.canteen, w.floor, w.win_no, w.name AS wname,
+                d.id AS did, d.name AS dname, d.price, d.intro,
+@@ -212,40 +312,97 @@
+             """, (month,))):
+             ranks[r["wid"]] = max(0, 20 - i)  # 第1名+20，线性衰减
+ 
+-    scored = []
+-    for r in rows:
+-        tags = _tag_dish(r["dname"], r["intro"], r["wname"], r["price"])
+-        avg = r["avg_score"] or 3.5
+-        s, matched = _score(tags, intent, avg, ranks.get(r["wid"], 0), r["price"])
+-        # 评论信号：口碑分 + 评论对意图的佐证
+-        wc = win_comment.get(r["wid"])
+-        if wc:
+-            s += max(-4, min(4, wc["sent"]))
+-            if wc["hits"]:
+-                s += 8 * len(wc["hits"])
+-        # 有明确意图时：至少命中一个意图维度（菜品标签或评论佐证）才有资格入围
+-        if intent:
+-            dish_hit = any(vals & tags.get(dim, set()) for dim, vals in intent.items())
+-            comment_hit = bool(wc and wc["hits"])
+-            if not (dish_hit or comment_hit):
++    # 硬约束：不辣 / 高蛋白 / 预算。三档放宽，先松软约束，最后才松预算
++    budget_cap = min(intent["budget"]) if "budget" in intent else None
++    semantic = {k: v for k, v in intent.items() if k not in ("budget", "avoid_spicy")}
++
++    def _pass(use_protein, use_budget):
++        out = []
++        for r in rows:
++            tags = _tag_dish(r["dname"], r["intro"], r["wname"], r["price"])
++            if intent.get("avoid_spicy") and "spicy" in tags.get("taste", set()):
+                 continue
+-        else:
+-            matched = ["高分热推"]
+-        scored.append((s, r, matched, tags))
+-    if not scored:  # 全被过滤（极端口语），回落全量按评分+榜单
++            if (use_protein and "high_protein" in intent.get("nutrition", set())
++                    and "high_protein" not in tags.get("nutrition", set())):
++                continue
++            if use_budget and budget_cap and r["price"] > budget_cap:
++                continue
++            avg = r["avg_score"] or 3.5
++            s, matched = _score(tags, intent, avg, ranks.get(r["wid"], 0), r["price"])
++            # 学生直接点名了菜名（「来份锅贴」）：这道菜本身要排前面
++            bare = re.sub(r"[（(].*?[)）]", "", r["dname"]).strip()
++            hit = _name_hit(q, bare)
++            if hit:
++                s += 60 if hit == 9 else 15 * hit
++                matched = ["就是这道"] + matched
++            wc = win_comment.get(r["wid"])
++            if wc:
++                s += max(-4, min(4, wc["sent"]))
++                if wc["hits"]:
++                    s += 8 * len(wc["hits"])
++            # 有语义意图时：至少命中一个维度（菜品标签或评论佐证）才入围
++            if semantic:
++                dish_hit = any(vals & tags.get(dim, set()) for dim, vals in semantic.items())
++                comment_hit = bool(wc and wc["hits"])
++                if not (dish_hit or comment_hit):
++                    continue
++            else:
++                matched = ["高分热推"]
++            out.append((s, r, matched, tags))
++        return out
++
++    scored = _pass(True, True)
++    if not scored:                      # 放宽高蛋白，预算仍硬
++        scored = _pass(False, True)
++    if not scored:                      # 再放宽预算
++        scored = _pass(False, False)
++    if not scored:  # 最后兜底：确实没有任何菜满足约束，退回按评分+榜单
+         for r in rows:
+             tags = _tag_dish(r["dname"], r["intro"], r["wname"], r["price"])
+             avg = r["avg_score"] or 3.5
+             scored.append(((avg - 3.0) * 10 + ranks.get(r["wid"], 0), r, ["高分热推"], tags))
+     scored.sort(key=lambda x: -x[0])
+-    # 同一窗口最多保留 2 道，保证推荐多样性
+-    picked, win_count = [], {}
+-    for item in scored:
+-        w = item[1]["wid"]
+-        if win_count.get(w, 0) >= 2:
+-            continue
+-        win_count[w] = win_count.get(w, 0) + 1
+-        picked.append(item)
++    # 没有明确需求（「今天吃啥」）时，别让三条都是主食：
++    # 按「主食 / 汤 / 菜」三组轮转重排，凑成一顿饭
++    if not intent:
++        def _group(tags):
++            cats = tags.get("cat", set())
++            tastes = tags.get("taste", set())
++            if cats & {"rice", "noodle", "dumpling"}:
++                return 0                       # 主食
++            if "soup" in cats:
++                return 1                       # 汤
++            if cats & {"meat", "veggie"}:
++                return 2                       # 菜
++            if "sweet" in tastes:
++                return 3                       # 甜品：只有凑不出饭才用
++            return 2
++
++        groups = {}
++        for item in scored:
++            groups.setdefault(_group(item[3]), []).append(item)
++        reordered = []
++        # 先把 主食/汤/菜 轮转排完，甜品垫在最后
++        while groups.get(0) or groups.get(1) or groups.get(2):
++            for g in (0, 1, 2):
++                if groups.get(g):
++                    reordered.append(groups[g].pop(0))
++        reordered += groups.get(3, [])
++        scored = reordered
++    # 多样性：先保证每个窗口最多 1 道，凑不满再放宽到 2 道（避免一个窗口占满 3 个名额）
++    picked, win_count, taken = [], {}, set()
++    for cap in (1, 2):
++        for item in scored:
++            if len(picked) >= limit:
++                break
++            if id(item) in taken:
++                continue
++            w = item[1]["wid"]
++            if win_count.get(w, 0) >= cap:
++                continue
++            win_count[w] = win_count.get(w, 0) + 1
++            taken.add(id(item))
++            picked.append(item)
+         if len(picked) >= limit:
+             break
+     scored = picked
+@@ -253,7 +410,13 @@
+     out = []
+     for s, r, matched, tags in scored[:limit]:
+         reason_bits = []
+-        if matched:
++        if intent.get("avoid_spicy"):
++            reason_bits.append("不辣/清淡")
++        if not intent:
++            # 没明确需求时不要说「符合高分热推」，换成能看懂的依据
++            if ranks.get(r["wid"], 0) >= 18:
++                reason_bits.append("本月榜前列")
++        elif matched:
+             reason_bits.append("符合「%s」" % "、".join(matched[:2]))
+         if r["price"] <= 10:
+             reason_bits.append("¥%g 学生价" % r["price"])
+@@ -265,12 +428,13 @@
+             reason_bits.append(r["intro"][:14])
+         out.append({
+             "dish": r["dname"], "window": r["wname"],
+-            "loc": "%s食堂%d楼" % (CN[r["canteen"] - 1], r["floor"]),
++            "loc": "%s食堂%d楼" % (canteen_name(r["canteen"]), r["floor"]),
+             "price": round(r["price"], 1),
+             "score": round(r["avg_score"] or 3.5, 2),
+             "reason": "，".join(reason_bits)[:40],
+             "intro": (r["intro"] or "")[:60],
+             "dish_id": r["did"], "window_id": r["wid"],
++            "warn": "、".join(warns.get(r["wid"], [])[:2]),
+         })
+     return out
+ 
+--- a/app.py	2026-10-24 17:47:33.424379100 +0800
++++ b/app.py	2026-10-24 17:30:12.933554600 +0800
+@@ -14,6 +14,7 @@
+ import secrets
+ import sqlite3
+ import string
++import time
+ from contextlib import contextmanager
+ from datetime import date, datetime, timedelta, timezone
+ from functools import wraps
+@@ -811,7 +812,7 @@
+ # ---------------------------------------------------------------- AI 点菜助手
+ def _ai_data_summary(conn):
+     """把菜品+评分+月榜+学生评论压成紧凑文本喂给 TeleAgent 智能体（每次实时查库）"""
+-    cn = ["一", "二", "三"]
++    import ai_local                      # 食堂名统一走 ai_local.canteen_name，不再第二份硬编码
+     rows = conn.execute("""
+         SELECT w.id AS wid, w.canteen, w.floor, w.name AS wname, d.name AS dname, d.price, d.intro,
+                (SELECT ROUND(AVG(r.score),2) FROM ratings r WHERE r.window_id=w.id) AS avg_score
+@@ -840,13 +841,13 @@
+     parts = ["【菜品数据】格式：位置|菜名|价格|简介|窗口评分"]
+     for r in rows:
+         parts.append("%s食堂%d楼%s|%s|¥%.1f|%s|评分%s" % (
+-            cn[r["canteen"] - 1], r["floor"], r["wname"], r["dname"],
++            ai_local.canteen_name(r["canteen"]), r["floor"], r["wname"], r["dname"],
+             r["price"], r["intro"], r["avg_score"] or "暂无"))
+     if board_rows:
+         parts.append("\n【本月榜单Top10】")
+         for i, b in enumerate(board_rows):
+             parts.append("%d.%s(%s食堂%d楼) 均分%s/%s人评" % (
+-                i + 1, b["wname"], cn[b["canteen"] - 1], b["floor"], b["a"], b["n"]))
++                i + 1, b["wname"], ai_local.canteen_name(b["canteen"]), b["floor"], b["a"], b["n"]))
+     parts.append("\n【学生评论精选】每窗口点赞最高的评论（截选，反映分量/口味/排队等真实口碑）")
+     wins = {}
+     for r in rows:
+@@ -856,14 +857,13 @@
+         if not cs:
+             continue
+         joined = " / ".join("「%s」赞%d" % (c[:40], l) for c, l in cs[:2])
+-        parts.append("%s食堂%d楼%s：%s" % (cn[c - 1], f, name, joined))
++        parts.append("%s食堂%d楼%s：%s" % (ai_local.canteen_name(c), f, name, joined))
+     return "\n".join(parts)
+ 
+ 
+ def _ai_data_summary_fast(conn, q):
+     """极速版数据摘要：本地引擎预筛候选菜，只把相关数据喂给模型（输入压缩到约1/4）"""
+     import ai_local
+-    cn = ["一", "二", "三"]
+     candidates = ai_local.recommend(conn, q, limit=45)
+     if not candidates:
+         return _ai_data_summary(conn)
+@@ -902,7 +902,7 @@
+         parts.append("\n【本月榜单Top10】")
+         for i, b in enumerate(board_rows):
+             parts.append("%d.%s(%s食堂%d楼) 均分%s/%s人评" % (
+-                i + 1, b["wname"], cn[b["canteen"] - 1], b["floor"], b["a"], b["n"]))
++                i + 1, b["wname"], ai_local.canteen_name(b["canteen"]), b["floor"], b["a"], b["n"]))
+     win_names = {c["window_id"]: (c["loc"], c["window"]) for c in candidates if c.get("window_id")}
+     if comments_by_win:
+         parts.append("\n【候选窗口学生评论精选】")
+@@ -913,20 +913,98 @@
+     return "\n".join(parts)
+ 
+ 
++def _window_comments(conn, wids, per=1, cut=24):
++    """给候选窗口各取 1 条点赞最高的评论，作为模型写理由的素材"""
++    out = {}
++    if not wids:
++        return out
++    marks = ",".join("?" * len(wids))
++    rows = conn.execute(
++        "SELECT p.window_id AS wid, p.content, "
++        "       (SELECT COUNT(*) FROM post_likes pl WHERE pl.post_id=p.id) AS likes "
++        "FROM posts p WHERE p.status=1 AND p.window_id IN (%s) "
++        "ORDER BY likes DESC, p.created_at DESC" % marks, list(wids)).fetchall()
++    for r in rows:
++        bucket = out.setdefault(r["wid"], [])
++        if len(bucket) < per:
++            bucket.append((r["content"] or "").strip()[:cut])
++    return out
++
++
++def _canteen_profile(conn, wids=None, per=3):
++    """把食堂压成一份「档案」：每个窗口一行，含位置、均分、价位、招牌菜。
++
++    这是让模型「看到全库」的正确姿势 —— 实测：
++      全量 244 道菜（6215 字）→ 19.5 秒，还会编菜名；
++      72 个窗口档案（3251 字）→ 5.0 秒，且能搭出「主食+配菜+甜品」。
++    """
++    import ai_local
++    sql = """
++        SELECT w.id, w.name, w.canteen, w.floor,
++               ROUND(AVG(r.score),2) AS a,
++               MIN(d.price) AS pmin, MAX(d.price) AS pmax
++        FROM windows w
++        LEFT JOIN ratings r ON r.window_id=w.id AND strftime('%Y-%m', r.date)=?
++        LEFT JOIN dishes d ON d.window_id=w.id AND d.status=1
++        WHERE w.status=1
++        GROUP BY w.id
++    """
++    params = [this_month()]
++    if wids:
++        sql += " HAVING w.id IN (%s)" % ",".join("?" * len(wids))
++        params += list(wids)
++    sql += " ORDER BY a DESC, w.id"
++    rows = conn.execute(sql, params).fetchall()
++    warns = ai_local.window_warnings(conn)
++
++    lines = []
++    for r in rows:
++        dishes = [x[0] for x in conn.execute(
++            "SELECT name FROM dishes WHERE window_id=? AND status=1 ORDER BY id LIMIT ?",
++            (r["id"], per))]
++        if not dishes:
++            continue
++        price = ("%g-%g元" % (r["pmin"], r["pmax"])) if r["pmin"] is not None else "暂无价"
++        warn = warns.get(r["id"]) or []
++        lines.append("%s（%s食堂%d楼）均分%s %s 招牌:%s%s" % (
++            r["name"], ai_local.canteen_name(r["canteen"]), r["floor"],
++            r["a"] or "暂无", price, "/".join(dishes),
++            (" ⚠" + "/".join(warn[:2])) if warn else ""))
++    return lines
++
++
+ def _ai_compact_prompt(conn, q, limit=12):
+-    """极速提示词：只给最相关的 12 道候选，输出要求压到最短（约 400 字）。"""
++    """提示词：把食堂压成「全窗口档案」给模型，让它看得到全局再自己搭一顿饭。
++
++    有明确意图时只给相关窗口（更快）；没有意图时给全部 72 个窗口（约 3.2k 字 / 5 秒）。
++    """
+     import ai_local
+-    cands = ai_local.recommend(conn, q, limit=limit)
+-    if not cands:
++    intent = ai_local.parse_intent(q)
++    wids = None
++    if intent:
++        try:
++            cands = ai_local.recommend(conn, q, limit=40)
++            wids = {c["window_id"] for c in cands if c.get("window_id")} or None
++        except Exception as e:
++            print("[ai] 意图筛窗口失败：%r" % e, flush=True)
++
++    profile = _canteen_profile(conn, wids, per=2)
++    if not profile:
+         return _ai_prompt(q, _ai_data_summary_fast(conn, q), fast=True)
+-    lines = ["菜名|窗口|位置|价|评分"]
+-    for c in cands:
+-        lines.append("%s|%s|%s|%s|%s" % (
+-            c["dish"], c["window"], c["loc"], c["price"], c.get("score") or "-"))
+-    return ("从下列菜品里挑3个最适合「%s」的，只输出JSON数组：\n"
+-            '[{"dish":"","window":"","loc":"","price":0,'
+-            '"reason":"推荐理由20字内","intro":"菜品介绍30字内"}]\n%s'
+-            % (q, "\n".join(lines)))
++
++    scope = ("全部 %d 个窗口" % len(profile)) if wids is None else ("与需求相关的 %d 个窗口" % len(profile))
++    return (
++        "下面是本校食堂%s（含招牌菜、价位、本月均分）。\n" % scope +
++        "\n".join(profile) +
++        "\n\n学生说：「%s」\n" % q +
++        "选3个搭成一顿饭：至少1个主食（饭/面/饺子），可配汤/小菜/甜品，别3个同类，不同窗口优先。"
++        "带 ⚠ 的窗口有学生差评，能避开就避开；避不开就在 reason 里提醒一句。"
++        "reason 要写具体依据（评分、价位、招牌特点、差评），20字内。\n"
++        "好理由示例：「4.33分，红油够辣」「9元，卤味分量足」「⚠排队久，赶时间别选」\n"
++        "坏理由示例：「评分高」「强烈推荐」「符合口味」——这种一律不要写。\n"
++        "dish 必须原样照抄档案里的菜名，不要改写。"
++        '只输出JSON数组：[{"dish":"","window":"","loc":"","price":0,"reason":"","intro":""}]'
++    )
+ 
+ 
+ def _ai_prompt(q, summary, fast=False):
+@@ -956,12 +1034,23 @@
+     if "```" in t:  # 剥 markdown 围栏
+         t = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", t.strip(), flags=re.M).strip()
+     m = re.search(r"\[[\s\S]*\]", t)
+-    if not m:
+-        return []
++    if m:
++        body = m.group(0)
++    else:
++        i = t.find("[")                 # 模型有时把数组截断，先截到 [ 再修
++        if i < 0:
++            return []
++        body = t[i:]
+     try:
+-        arr = _json.loads(m.group(0))
++        arr = _json.loads(body)
+     except Exception:
+-        return []
++        j = body.rfind("}")             # 截断修复：补到最后一个完整对象
++        if j < 0:
++            return []
++        try:
++            arr = _json.loads(body[:j + 1] + "]")
++        except Exception:
++            return []
+     items = []
+     if isinstance(arr, list):
+         for a in arr:
+@@ -969,13 +1058,23 @@
+                 continue
+             dish = str(a.get("dish") or a.get("name") or "").strip()
+             if not dish:
+-                continue
++                continue                    # schema：dish 必填
++            price = a.get("price")
++            if isinstance(price, bool) or not isinstance(price, (int, float)):
++                price = None
++            elif not (0 <= price <= 100):
++                price = None                # schema：price 0~100，越界丢弃
++            score = a.get("score")
++            if isinstance(score, bool) or not isinstance(score, (int, float)):
++                score = None
++            elif not (0 <= score <= 5):
++                score = None                # schema：score 0~5，越界丢弃
+             items.append({
+                 "dish": dish[:40],
+                 "window": str(a.get("window") or "").strip()[:30],
+                 "loc": str(a.get("loc") or "").strip()[:30],
+-                "price": a.get("price") if isinstance(a.get("price"), (int, float)) else None,
+-                "score": a.get("score") if isinstance(a.get("score"), (int, float)) else None,
++                "price": price,
++                "score": score,
+                 "reason": str(a.get("reason") or "").strip()[:80],
+                 "intro": str(a.get("intro") or "").strip()[:80],
+             })
+@@ -983,19 +1082,194 @@
+ 
+ 
+ def _attach_dish_info(conn, items):
+-    """按菜名回查 dish_id/window_id/照片/介绍，前端可点击跳转窗口详情"""
+-    for it in items:
+-        row = conn.execute(
+-            "SELECT d.id AS did, d.photo, d.intro, w.id AS wid FROM dishes d JOIN windows w ON w.id=d.window_id "
+-            "WHERE d.name LIKE ? AND d.status=1 LIMIT 1", (it["dish"],)).fetchone()
++    """AI 只负责「选哪道菜 + 写理由」；价格/窗口/位置/评分一律以数据库为准。
++    菜名在库里对不上就丢弃，绝不把 AI 编的价格放给前端。"""
++    import ai_local
++    warns = ai_local.window_warnings(conn)
++    fixed = []
++    for it in items or []:
++        name = (it.get("dish") or "").strip()
++        if not name:
++            continue
++        rows = conn.execute(
++            "SELECT d.id AS did, d.name AS dname, d.price, d.intro, d.photo, "
++            "       w.id AS wid, w.name AS wname, w.canteen, w.floor, "
++            "       (SELECT ROUND(AVG(r.score),2) FROM ratings r WHERE r.window_id=w.id) AS avg_score "
++            "FROM dishes d JOIN windows w ON w.id=d.window_id "
++            "WHERE d.status=1 AND w.status=1 AND d.name=? ORDER BY d.id", (name,)).fetchall()
++        if not rows:
++            continue                        # 菜名不存在 → 丢弃
++        row = rows[0]
++        for cand in rows:                   # 同名菜：优先取 AI 说的那个窗口
++            if it.get("window") and cand["wname"] == it["window"]:
++                row = cand
++                break
++        it["dish"] = row["dname"]
++        it["dish_id"] = row["did"]
++        it["window_id"] = row["wid"]
++        it["window"] = row["wname"]
++        it["loc"] = "%s食堂%d楼" % (ai_local.canteen_name(row["canteen"]), row["floor"])
++        it["price"] = round(row["price"], 1)            # 覆盖 AI 价格
++        it["score"] = round(row["avg_score"] or 3.5, 2)  # 覆盖 AI 评分
++        if row["photo"]:
++            it["photo"] = row["photo"]
++        if row["intro"]:
++            it["intro"] = row["intro"][:80]
++        it["warn"] = "、".join(warns.get(row["wid"], [])[:2])
++        fixed.append(it)
++        if len(fixed) >= 3:
++            break
++    return fixed
++
++
++def _finalize_ai_items(conn, items, q="", want=3):
++    """AI 结果落地：数据库覆盖 → 不足 3 条用本地引擎补齐 → 「不辣」时清掉理由里的辣字。"""
++    import ai_local
++    fixed = _attach_dish_info(conn, items)
++    if len(fixed) < want:
++        seen = {(x.get("dish_id"), x.get("window_id")) for x in fixed}
++        try:
++            for loc in ai_local.recommend(conn, q or "", limit=want + 4):
++                key = (loc.get("dish_id"), loc.get("window_id"))
++                if key in seen:
++                    continue
++                seen.add(key)
++                fixed.append(dict(loc))
++                if len(fixed) >= want:
++                    break
++        except Exception as e:
++            print("[ai] 本地补齐失败：%r" % e, flush=True)
++    if q and ai_local.NEG_SPICY.search(q):
++        for it in fixed:
++            r = it.get("reason") or ""
++            if "辣" in r:
++                bits = [b for b in r.split("，") if "辣" not in b]
++                it["reason"] = ("，".join(bits)[:40]) or "不辣/清淡"
++    return fixed[:want]
++
++
++def _local_fallback_items(conn, q, want=3):
++    """本地兜底：引擎挂了/超时/JSON 不合法时，保证一定有 3 条。"""
++    import ai_local
++    try:
++        got = ai_local.recommend(conn, q or "", limit=want)
++    except Exception as e:
++        print("[ai] 本地推荐异常：%r" % e, flush=True)
++        got = []
++    if got:
++        return got
++    rows = conn.execute(
++        "SELECT d.id AS did, d.name AS dname, d.price, d.intro, w.id AS wid, "
++        "       w.name AS wname, w.canteen, w.floor, "
++        "       (SELECT ROUND(AVG(r.score),2) FROM ratings r WHERE r.window_id=w.id) AS avg_score "
++        "FROM dishes d JOIN windows w ON w.id=d.window_id "
++        "WHERE d.status=1 AND w.status=1 "
++        "ORDER BY (SELECT AVG(r.score) FROM ratings r WHERE r.window_id=w.id) DESC, d.id LIMIT ?",
++        (want,)).fetchall()
++    out = []
++    for r in rows:
++        out.append({
++            "dish": r["dname"], "window": r["wname"],
++            "loc": "%s食堂%d楼" % (ai_local.canteen_name(r["canteen"]), r["floor"]),
++            "price": round(r["price"], 1),
++            "score": round(r["avg_score"] or 3.5, 2),
++            "reason": "评分最高的窗口菜",
++            "intro": (r["intro"] or "")[:60],
++            "dish_id": r["did"], "window_id": r["wid"],
++        })
++    return out
++
++
++# 结果缓存：同一句话 10 分钟内再问，直接给上次大模型想好的结果。
++# 模型服务本身波动很大（同一提示词 7~17 秒），演示时重复提问不该再等一遍。
++_AI_CACHE = {}
++_AI_CACHE_TTL = 600
++
++
++def _cache_get(q):
++    hit = _AI_CACHE.get(q)
++    if hit and time.time() - hit[0] < _AI_CACHE_TTL:
++        return hit[1]
++    return None
++
++
++def _cache_put(q, items):
++    if not items:
++        return
++    _AI_CACHE[q] = (time.time(), items)
++    if len(_AI_CACHE) > 200:                 # 简单淘汰，删最早的一批
++        for k in list(_AI_CACHE)[:50]:
++            _AI_CACHE.pop(k, None)
++
++
++def _ensure_ai_answers(conn):
++    """预生成答案表：重启后仍命中，演示时高频问题秒回。"""
++    try:
++        conn.execute("""
++            CREATE TABLE IF NOT EXISTS ai_answers(
++                q TEXT PRIMARY KEY,
++                items TEXT NOT NULL,
++                engine TEXT NOT NULL DEFAULT 'engine',
++                created_at TEXT NOT NULL
++            )""")
++    except Exception as e:
++        print("[ai] 建 ai_answers 表失败：%r" % e, flush=True)
++
++
++def _answer_get(conn, q):
++    import json as _json
++    try:
++        _ensure_ai_answers(conn)
++        row = conn.execute("SELECT items FROM ai_answers WHERE q=?", (q,)).fetchone()
+         if row:
+-            it["dish_id"] = row["did"]
+-            it["window_id"] = row["wid"]
+-            if row["photo"]:
+-                it["photo"] = row["photo"]
+-            if not it.get("intro") and row["intro"]:
+-                it["intro"] = row["intro"][:80]
+-    return items
++            return _json.loads(row["items"])
++    except Exception as e:
++        print("[ai] 读预生成答案失败：%r" % e, flush=True)
++    return None
++
++
++def _answer_put(conn, q, items):
++    import json as _json
++    if not items:
++        return
++    try:
++        _ensure_ai_answers(conn)
++        conn.execute("INSERT OR REPLACE INTO ai_answers(q, items, engine, created_at) VALUES (?,?,?,?)",
++                     (q, _json.dumps(items, ensure_ascii=False), "engine", now()))
++    except Exception as e:
++        print("[ai] 写预生成答案失败：%r" % e, flush=True)
++
++
++def _invalidate_answers(conn=None, did=None):
++    """商家改价/下架/换图后清缓存。
++
++    给了 did 就**只删包含这道菜的缓存行**，其它预生成答案保留 ——
++    否则改一次价，8 条高频答案全没了，演示时预设问题会突然从 0.2 秒变回十几秒。
++    """
++    import json as _json
++    _AI_CACHE.clear()
++    try:
++        def _run(c):
++            _ensure_ai_answers(c)
++            if did is None:
++                c.execute("DELETE FROM ai_answers")
++                return
++            for r in list(c.execute("SELECT q, items FROM ai_answers")):
++                try:
++                    items = _json.loads(r["items"])
++                except Exception:
++                    c.execute("DELETE FROM ai_answers WHERE q=?", (r["q"],))
++                    continue
++                if any(it.get("dish_id") == did for it in items):
++                    c.execute("DELETE FROM ai_answers WHERE q=?", (r["q"],))
++
++        if conn is not None:
++            _run(conn)
++        else:
++            with get_db() as c:
++                _run(c)
++    except Exception as e:
++        print("[ai] 清预生成答案失败：%r" % e, flush=True)
+ 
+ 
+ def _ai_cloud_fast(q, summary, timeout=8):
+@@ -1064,7 +1338,7 @@
+         engine = "local"
+     elif engine == "teleagent":
+         with get_db() as c:
+-            items = _attach_dish_info(c, items)
++            items = _finalize_ai_items(c, items, q)
+ 
+     if not items:
+         return err("暂时没推出来，换个说法试试（比如「想吃点凉的」）")
+@@ -1090,7 +1364,8 @@
+         items = _parse_ai_items(answer)
+         if items:
+             with get_db() as c:
+-                items = _attach_dish_info(c, items)
++                items = _finalize_ai_items(c, items, q)
++        if items:
+             _AI_JOBS[job_id].update(status="done", items=items, engine="teleagent")
+         else:
+             _AI_JOBS[job_id].update(status="failed", error="模型没返回有效结果")
+@@ -1106,16 +1381,17 @@
+                 _AI_JOBS.pop(k, None)
+ 
+ 
+-def _run_engine_job(job_id, prompt):
++def _run_engine_job(job_id, prompt, q=""):
+     """后台线程：走 4397 引擎直连（约 4 秒），结果写回 _AI_JOBS"""
+     try:
+         import teleagent_client
+         model = os.environ.get("AI_ENGINE_MODEL", "chat-lite")
+-        answer = teleagent_client.engine_ask(prompt, model=model, timeout=12)
++        answer = teleagent_client.engine_ask(prompt, model=model, timeout=18)
+         items = _parse_ai_items(answer)
+         if items:
+             with get_db() as c:
+-                items = _attach_dish_info(c, items)
++                items = _finalize_ai_items(c, items, q)
++        if items:
+             _AI_JOBS[job_id].update(status="done", items=items, engine="engine")
+         else:
+             _AI_JOBS[job_id].update(status="failed", error="模型没返回有效结果")
+@@ -1152,7 +1428,7 @@
+         cloud = _ai_cloud_fast(q, summary, timeout=8)
+         if cloud:
+             with get_db() as c:
+-                cloud = _attach_dish_info(c, cloud)
++                cloud = _finalize_ai_items(c, cloud, q)
+             return ok({"q": q, "engine": "cloud", "items": cloud,
+                        "job_id": None, "upgrading": False, "can_upgrade": False})
+     except Exception as e:
+@@ -1170,7 +1446,7 @@
+                 job_id = "aijob-%d-%s" % (_AI_JOB_SEQ[0], secrets.token_hex(4))
+                 _AI_JOBS[job_id] = {"status": "running", "items": None, "error": None,
+                                     "q": q, "ts": datetime.now(CN_TZ).timestamp()}
+-            threading.Thread(target=_run_engine_job, args=(job_id, prompt), daemon=True).start()
++            threading.Thread(target=_run_engine_job, args=(job_id, prompt, q), daemon=True).start()
+     except Exception as e:
+         print("[ai] 引擎任务启动失败：%r" % e, flush=True)
+ 
+@@ -1201,7 +1477,7 @@
+     if engine_ok:
+         with get_db() as c:
+             prompt = _ai_compact_prompt(c, q)
+-        threading.Thread(target=_run_engine_job, args=(job_id, prompt), daemon=True).start()
++        threading.Thread(target=_run_engine_job, args=(job_id, prompt, q), daemon=True).start()
+     else:
+         threading.Thread(target=_run_teleagent_job, args=(job_id, q), daemon=True).start()
+     return ok({"job_id": job_id})
+@@ -1209,19 +1485,30 @@
+ 
+ @app.route("/api/ai/stream", methods=["POST"])
+ def api_ai_stream():
+-    """流式版：SSE 推送本地结果 + 引擎正文 delta + 最终结构化推荐（含理由/介绍）。"""
++    """流式版：SSE 推送本地结果 + 引擎正文 delta + 最终结构化推荐（含理由/介绍）。
++    原则：任何环节出错都不许 500 —— 先出本地 3 条，再发 done。"""
+     data = request.get_json(force=True, silent=True) or {}
+     q = (data.get("q") or "").strip()
+     if not q or len(q) > 60:
+         return err("用一句话说说你想吃什么（60 字内）")
+ 
+-    import ai_local
+     import teleagent_client
+-    with get_db() as c:
+-        local_items = ai_local.recommend(c, q)
+-        prompt = _ai_compact_prompt(c, q)
+-    if not local_items:
+-        return err("暂时没推出来，换个说法试试（比如「想吃点凉的」）")
++
++    # 1) 本地兜底先算出来，后面任何一步失败都还有东西可发
++    local_items = []
++    try:
++        with get_db() as c:
++            local_items = _local_fallback_items(c, q)
++    except Exception as e:
++        print("[ai] stream 本地兜底异常：%r" % e, flush=True)
++
++    # 2) 提示词构建放进 try：原来它在 gen() 外面，第 4 食堂越界就把整个请求打成 500
++    prompt = None
++    try:
++        with get_db() as c:
++            prompt = _ai_compact_prompt(c, q)
++    except Exception as e:
++        print("[ai] stream 提示词构建失败：%r" % e, flush=True)
+ 
+     def gen():
+         import json as _json
+@@ -1230,33 +1517,85 @@
+             return "event: %s\ndata: %s\n\n" % (evt, _json.dumps(payload, ensure_ascii=False))
+ 
+         yield send("local", {"items": local_items})
+-        if not teleagent_client.engine_available():
++        # 同一句话问过：内存缓存 → 预生成表，都不再等模型
++        cached = _cache_get(q)
++        if not cached:
++            try:
++                with get_db() as c:
++                    cached = _answer_get(c, q)
++            except Exception:
++                cached = None
++            if cached:
++                _cache_put(q, cached)
++        if cached:
++            # 缓存里存的是生成时的价格；商家可能已经改价/下架，
++            # 所以命中缓存也必须重新过一遍数据库覆盖，否则会显示旧价。
++            try:
++                with get_db() as c:
++                    cached = _finalize_ai_items(c, cached, q)
++                    if cached:
++                        _answer_put(c, q, cached)      # 顺手把纠正后的写回缓存
++                        _cache_put(q, cached)
++            except Exception as e:
++                print("[ai] 缓存落地失败：%r" % e, flush=True)
++                cached = None
++            if cached:
++                print("[ai] stream: cache hit", flush=True)
++                yield send("done", {"items": cached, "engine": "engine", "note": "cached"})
++                return
++            cached = None
++        if not prompt:
++            print("[ai] stream: prompt unavailable, local only", flush=True)
++            yield send("done", {"items": local_items, "engine": "local",
++                                "note": "engine prompt unavailable"})
++            return
++        try:
++            engine_ok = teleagent_client.engine_available()
++        except Exception as e:
++            print("[ai] stream engine_available 异常：%r" % e, flush=True)
++            engine_ok = False
++        if not engine_ok:
+             print("[ai] stream: engine unavailable", flush=True)
+             yield send("done", {"items": local_items, "engine": "local"})
+             return
+         buf = ""
+         model = os.environ.get("AI_ENGINE_MODEL", "chat-lite")
+-        for chunk in teleagent_client.engine_stream(prompt, model=model, timeout=12):
+-            if chunk["type"] == "delta":
+-                if chunk.get("part") == "text":
+-                    buf += chunk["text"]
+-                yield send("delta", {"text": chunk["text"], "part": chunk.get("part")})
+-            elif chunk["type"] == "error":
+-                print("[ai] stream error: %s" % chunk.get("message"), flush=True)
+-                yield send("done", {"items": local_items, "engine": "local",
+-                                    "note": chunk.get("message")})
+-                return
+-            elif chunk["type"] == "done":
+-                full = chunk.get("full") or buf
+-                items = _parse_ai_items(full)
+-                print("[ai] stream done: full=%d items=%d" % (len(full), len(items)), flush=True)
+-                if items:
+-                    with get_db() as c:
+-                        items = _attach_dish_info(c, items)
+-                    yield send("done", {"items": items, "engine": "engine"})
+-                else:
+-                    yield send("done", {"items": local_items, "engine": "local"})
+-                return
++        try:
++            for chunk in teleagent_client.engine_stream(prompt, model=model, timeout=25):
++                if chunk["type"] == "delta":
++                    if chunk.get("part") == "text":
++                        buf += chunk["text"]
++                    yield send("delta", {"text": chunk["text"], "part": chunk.get("part")})
++                elif chunk["type"] == "error":
++                    print("[ai] stream error: %s" % chunk.get("message"), flush=True)
++                    yield send("done", {"items": local_items, "engine": "local",
++                                        "note": chunk.get("message")})
++                    return
++                elif chunk["type"] == "done":
++                    full = chunk.get("full") or buf
++                    items = _parse_ai_items(full)
++                    print("[ai] stream done: full=%d items=%d" % (len(full), len(items)), flush=True)
++                    if items:
++                        with get_db() as c:
++                            items = _finalize_ai_items(c, items, q)
++                        if items:
++                            _cache_put(q, items)
++                            try:
++                                with get_db() as c:
++                                    _answer_put(c, q, items)
++                            except Exception:
++                                pass
++                            yield send("done", {"items": items, "engine": "engine"})
++                            return
++                    yield send("done", {"items": local_items, "engine": "local",
++                                        "note": "engine returned no valid items"})
++                    return
++            yield send("done", {"items": local_items, "engine": "local",
++                                "note": "engine stream ended without done"})
++        except Exception as e:
++            print("[ai] stream 引擎异常：%r" % e, flush=True)
++            yield send("done", {"items": local_items, "engine": "local",
++                                "note": "engine exception: %s" % e})
+ 
+     return Response(gen(), mimetype="text/event-stream",
+                     headers={"Cache-Control": "no-cache",
+@@ -1357,6 +1696,7 @@
+         updates.append("updated_at=?"); args.append(now())
+         args.append(did)
+         c.execute("UPDATE dishes SET %s WHERE id=?" % ",".join(updates), args)
++        _invalidate_answers(c, did)
+         return ok()
+ 
+ 
+@@ -1383,6 +1723,7 @@
+                 os.remove(os.path.join(UPLOAD_DIR, old))
+             except OSError:
+                 pass
++        _invalidate_answers(c, did)
+         return ok({"photo": "/uploads/" + fname})
+ 
+ 
+--- a/static/app.js	2026-10-24 17:47:33.318343900 +0800
++++ b/static/app.js	2026-10-24 14:54:14.349578900 +0800
+@@ -1082,7 +1082,7 @@
+         <div class="ai-rank">${i + 1}</div>
+         <div class="ai-main">
+           <div class="ai-dish">${esc(it.dish)}<span class="ai-price">¥${it.price != null ? it.price : "-"}</span></div>
+-          <div class="ai-meta">${esc(it.window)} · ${esc(it.loc)}${it.score != null ? ` · 评分 ${it.score}` : ""}</div>
++          <div class="ai-meta">${esc(it.window)} · ${esc(it.loc)}${it.score != null ? ` · 评分 ${it.score}` : ""}${it.warn && !(it.reason || "").includes("⚠") ? ` <span class="ai-warn" title="来自学生评论">⚠ ${esc(it.warn)}</span>` : ""}</div>
+           <div class="ai-reason">${esc(it.reason)}</div>
+           ${it.intro ? `<div class="ai-intro">${esc(it.intro)}</div>` : ""}
+         </div>
+@@ -1183,9 +1183,12 @@
+               aiCardsHtml(items) +
+               `<div class="ai-foot">${icon("sparkles")} 大模型结合评分、评论、榜单的深度推荐</div>`;
+           } else if (items.length) {
++            /* 大模型没成功时如实说明，别让学生以为是 AI 想的 */
++            const foot = data.note
++              ? `<div class="ai-foot" style="color:#b45309">${icon("info")} 大模型这次没返回（${esc(String(data.note).slice(0, 32))}），以下为本机推荐</div>`
++              : `<div class="ai-foot">${icon("cpu")} 本机推荐引擎（结合评分、评论、榜单，离线可用）</div>`;
+             box.innerHTML = `<div class="ai-done">${aiBadgeHtml(eng)}<span class="ai-sec">${sec}s</span></div>` +
+-              aiCardsHtml(items) +
+-              `<div class="ai-foot">${icon("cpu")} 本机推荐引擎（结合评分、评论、榜单，离线可用）</div>`;
++              aiCardsHtml(items) + foot;
+           }
+         }
+       }
+--- a/static/style.css	2026-10-24 17:47:33.319346300 +0800
++++ b/static/style.css	2026-10-24 14:54:14.350588900 +0800
+@@ -876,3 +876,11 @@
+ /* 卡片替换时的新内容入场动画 */
+ .ai-done ~ .ai-card { animation: aiSlideIn .35s ease both; }
+ @keyframes aiSlideIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
++
++/* 推荐卡片的避雷标签（来自学生差评关键词，规则打标，不经过模型） */
++.ai-warn {
++  display: inline-block; margin-left: 4px; padding: 1px 6px;
++  border-radius: 6px; font-size: 11px; line-height: 1.5;
++  color: #b45309; background: #fef3c7; border: 1px solid #fde68a;
++  vertical-align: middle;
++}

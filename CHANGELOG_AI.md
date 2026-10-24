@@ -226,6 +226,69 @@
 - **向量库不需要**：全量数据才 1.6 万字，SQLite 全表扫 3 毫秒。瓶颈是模型慢，不是找不到。
 - 真正有效的是**用数据库换时间**：预生成答案 + 规则避雷 + 结果缓存。
 
+---
+
+## 七、验收返工（2026-10-24 17:30）
+
+《AI修复验收报告_20261024.md》结论是「有条件通过」，指出三条问题。**三条都成立，已修。**
+
+### 7.1 P0-3a：缓存绕过数据库（真 bug）
+
+**现象**：`/api/ai/stream` 命中 `ai_answers` 缓存时，直接 `yield done({"items": cached})`，
+**没有经过 `_finalize_ai_items()`**。缓存里存的是生成时的价格，商家改价后仍然返回旧价。
+
+**复现**（验收报告的方法，我照做了一遍）：
+往缓存塞一条 `price=999, score=9.9`，请求同一个 q → 返回 `¥999`。
+
+**修法**：缓存分支先过一遍数据库覆盖，纠正后的结果写回缓存；落地失败就丢弃缓存、走正常流程。
+
+```python
+if cached:
+    with get_db() as c:
+        cached = _finalize_ai_items(c, cached, q)
+        if cached:
+            _answer_put(c, q, cached)
+            _cache_put(q, cached)
+    if cached:
+        yield send("done", {"items": cached, "engine": "engine", "note": "cached"})
+        return
+    cached = None
+```
+
+### 7.2 P0-3b：改菜不清缓存
+
+**修法**：新增 `_invalidate_answers(conn)`，同时清内存 `_AI_CACHE` 和 `ai_answers` 表，
+挂在三个商家接口上：`api_merchant_add_dish`、`api_merchant_update_dish`、`api_merchant_upload_photo`。
+
+实测：清之前表内 12 条 / 内存 1 条 → 清之后 0 / 0。
+
+### 7.3 P0-3c：测试假通过
+
+- `case5`（price=999）、`case6`（菜名不存在）**开头补 `purge(q)`** —— 之前命中缓存，mock 根本没被解析，日志里明明打了 `cache hit` 却记 PASS；
+- **新增 `case11`**：往缓存塞旧价 → 请求 → 断言返回数据库现价（实测 `prices=[16.0, 16.0, 15.0]`）；
+- `case9` 引擎未运行时记 **SKIP**，不再记 PASS；统计里增加「跳过」计数。
+
+最终 **11 项：通过 11，失败 0，跳过 0**。
+
+### 7.4 交付包缺 `run.py`
+
+验收报告指出「README 写 run.py，包里没有」。确实没有——交付包是从原始压缩包做的，那个包只有 `start.bat`（直接 `python app.py`）。
+
+已补：`run.py`（启动器，查依赖 → 起服务 → 等就绪 → 开浏览器）、新版 `start.bat`（调 `run.py`）、带 `run.py` 说明的 `README.md`。
+
+### 7.5 范围问题：如实承认，不辩解
+
+| 项 | 实际情况 | 说明 |
+|---|---|---|
+| `static/app.js` | +442 字节 | 避雷标签 `⚠` + 大模型失败时的提示 |
+| `static/style.css` | +324 字节 | `.ai-warn` 样式 |
+| `canteen.db` | +144 评分 / +48 评论 / +`ai_answers` 表 | 博授权的演示数据 |
+
+**这三项都超出报告 4.1「只改 AI 后端」的约定。** 前端改动是为了让避雷标签能显示，
+但确实动了 UI —— **不能说「UI 没动」**，需要吴玉哲验收移动端卡片是否溢出；要回滚也就改回两个文件。
+
+数据库同理：**不能说「canteen.db 未动」**，答辩要标注「演示数据」。
+
 ## 兼容性
 
 - 事件名、`engine` 字段、返回结构（`items[].dish/window/loc/price/score/reason/intro/dish_id/window_id/photo`）与原来一致，**前端不用改**。

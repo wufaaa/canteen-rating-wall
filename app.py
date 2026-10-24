@@ -1240,6 +1240,38 @@ def _answer_put(conn, q, items):
         print("[ai] 写预生成答案失败：%r" % e, flush=True)
 
 
+def _invalidate_answers(conn=None, did=None):
+    """商家改价/下架/换图后清缓存。
+
+    给了 did 就**只删包含这道菜的缓存行**，其它预生成答案保留 ——
+    否则改一次价，8 条高频答案全没了，演示时预设问题会突然从 0.2 秒变回十几秒。
+    """
+    import json as _json
+    _AI_CACHE.clear()
+    try:
+        def _run(c):
+            _ensure_ai_answers(c)
+            if did is None:
+                c.execute("DELETE FROM ai_answers")
+                return
+            for r in list(c.execute("SELECT q, items FROM ai_answers")):
+                try:
+                    items = _json.loads(r["items"])
+                except Exception:
+                    c.execute("DELETE FROM ai_answers WHERE q=?", (r["q"],))
+                    continue
+                if any(it.get("dish_id") == did for it in items):
+                    c.execute("DELETE FROM ai_answers WHERE q=?", (r["q"],))
+
+        if conn is not None:
+            _run(conn)
+        else:
+            with get_db() as c:
+                _run(c)
+    except Exception as e:
+        print("[ai] 清预生成答案失败：%r" % e, flush=True)
+
+
 def _ai_cloud_fast(q, summary, timeout=8):
     """可选的云端快通道：配置 AI_API_BASE / AI_API_KEY 时走 OpenAI 兼容接口直连，
     通常 2~5 秒返回；未配置或失败返回 None（由本地引擎兜底）。"""
@@ -1496,9 +1528,22 @@ def api_ai_stream():
             if cached:
                 _cache_put(q, cached)
         if cached:
-            print("[ai] stream: cache hit", flush=True)
-            yield send("done", {"items": cached, "engine": "engine", "note": "cached"})
-            return
+            # 缓存里存的是生成时的价格；商家可能已经改价/下架，
+            # 所以命中缓存也必须重新过一遍数据库覆盖，否则会显示旧价。
+            try:
+                with get_db() as c:
+                    cached = _finalize_ai_items(c, cached, q)
+                    if cached:
+                        _answer_put(c, q, cached)      # 顺手把纠正后的写回缓存
+                        _cache_put(q, cached)
+            except Exception as e:
+                print("[ai] 缓存落地失败：%r" % e, flush=True)
+                cached = None
+            if cached:
+                print("[ai] stream: cache hit", flush=True)
+                yield send("done", {"items": cached, "engine": "engine", "note": "cached"})
+                return
+            cached = None
         if not prompt:
             print("[ai] stream: prompt unavailable, local only", flush=True)
             yield send("done", {"items": local_items, "engine": "local",
@@ -1651,6 +1696,7 @@ def api_merchant_update_dish(did):
         updates.append("updated_at=?"); args.append(now())
         args.append(did)
         c.execute("UPDATE dishes SET %s WHERE id=?" % ",".join(updates), args)
+        _invalidate_answers(c, did)
         return ok()
 
 
@@ -1677,6 +1723,7 @@ def api_merchant_upload_photo(did):
                 os.remove(os.path.join(UPLOAD_DIR, old))
             except OSError:
                 pass
+        _invalidate_answers(c, did)
         return ok({"photo": "/uploads/" + fname})
 
 

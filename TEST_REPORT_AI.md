@@ -1,9 +1,10 @@
 # TEST_REPORT_AI.md
 
-> 对象：`智慧食堂_AI修复_副本.zip`
+> 对象：`智慧食堂_AI修复_交付包_20261024.zip`（项目/ 目录）
 > 时间：2026-10-24
 > 环境：Windows / Python 3.13 / Flask test client / 数据库 `canteen.db`（4 食堂 · 72 窗口 · 244 菜 · 479 帖 · 1690 评分，演示数据）
-> 总结果：**10 项全部通过（10/10）**
+> 总结果：**11 项全部通过（11/11，0 跳过）**
+> 变更：验收返工后 case5/case6 补 `purge()`，新增 case11（缓存旧价），case9 未运行时记 SKIP。
 
 ## 怎么跑
 
@@ -21,29 +22,32 @@
 [ai] stream done: full=14 items=0
   [PASS] #4 JSON 不合法 → 不 500，自动 local
         status=200 engine=local note='engine returned no valid items'
-[ai] stream: cache hit
+[ai] stream done: full=100 items=1
   [PASS] #5 AI 报错价格 999 → 用数据库价格
         status=200
           黄焖鸡米饭(大份) ¥16.0 @一食堂1楼
           泰式打抛饭 ¥16.0 @二食堂2楼
           孜然羊肉炒面 ¥15.0 @一食堂1楼
-[ai] stream: cache hit
+[ai] stream done: full=90 items=1
   [PASS] #6 菜名不存在 → 丢弃并本地补齐
         status=200 items=冬阴功汤粉、牛肉拉面(清真)、淮南牛肉汤+饼
 [ai] stream: cache hit
   [PASS] #7 SSE 格式（local/done 各 1 次、无 HTML）
-        status=200 local=1 done=1 bytes=1318
+        status=200 local=1 done=1 bytes=1331
   [PASS] #8 约束冲突（不辣+麻辣）按不辣优先
         items=岩烧乳酪蛋糕、叉烧滑蛋饭、招牌猪脚饭
-[ai] stream done: full=346 items=3
+[ai] stream done: full=347 items=3
   [PASS] #9 真实引擎冒烟
         status=200 engine=engine items=3
-        冬阴功汤粉 ¥15.0、番茄牛腩盖浇饭 ¥17.0、缤纷水果捞 ¥13.0
+        冬阴功汤粉 ¥15.0、酸菜猪肉水饺(15只) ¥12.0、缤纷水果捞 ¥13.0
 [ai] stream: cache hit
   [PASS] #10 预生成答案命中（应 <1.5s）
-        status=200 0.15s note='cached' items=3
+        status=200 0.27s note='cached' items=3
+[ai] stream: cache hit
+  [PASS] #11 缓存旧价被数据库纠正
+        status=200 note='cached' prices=[16.0, 16.0, 15.0]
 --------------------------------------------------------------
-合计 10 项：通过 10，失败 0
+合计 11 项：通过 11，失败 0，跳过 0
 ```
 
 脚本用 Flask `test_client` 直接打接口，不依赖浏览器；需要引擎的用例用 mock，
@@ -245,6 +249,17 @@ curl -N -X POST http://127.0.0.1:5001/api/ai/stream \
 **实际结果**：`200`，**0.15 秒**，`note="cached"`，3 条。
 
 > 注意：用例 3 与 9 会用 `purge()` 清掉对应问法的缓存，否则会被预生成结果干扰（曾经因此误判一次）。
+
+### #11 缓存旧价被数据库纠正（验收返工新增）· PASS
+
+**背景**：验收报告发现，缓存命中时直接返回旧 items，绕过了 P0-3 的数据库覆盖。
+
+**命令**：往 `ai_answers` 插入一条 `price=999, score=9.9` 的缓存，再请求同一个 q。
+
+**修复前**：`黄焖鸡米饭(大份) ¥999 score=9.9`
+**修复后**：`status=200 note='cached' prices=[16.0, 16.0, 15.0]`
+
+另附：`_invalidate_answers()` 实测清缓存——清之前表内 12 条 / 内存 1 条，清之后 0 / 0。
 
 ## 已知未覆盖
 

@@ -4,8 +4,9 @@
 用途：演示时点预设问题 → 直接命中缓存秒回，不再等模型 5~20 秒。
 
 用法：
-    python _warm_answers.py            # 只补没有的
-    python _warm_answers.py --force    # 全部重算
+    python _warm_answers.py                          # 用当前目录的 canteen.db，只补没有的
+    python _warm_answers.py --force                  # 全部重算
+    python _warm_answers.py D://path//canteen.db       # 指定库（推荐：直接对桌面库跑，不要整库覆盖）
 
 每一条都是真跑大模型生成的（不是编的），只是把结果存下来了。
 """
@@ -36,10 +37,13 @@ QUERIES = [
 
 def main():
     force = "--force" in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    db_path = args[0] if args else os.path.join(BASE, "canteen.db")
+    print("目标库：%s" % db_path)
     if not teleagent_client.engine_available():
         sys.exit("TeleAgent 引擎没起来（4397），先启动桌面端")
 
-    conn = sqlite3.connect(os.path.join(BASE, "canteen.db"))
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     appmod._ensure_ai_answers(conn)
     conn.commit()

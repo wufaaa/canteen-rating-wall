@@ -28,9 +28,9 @@ SPICY_WORDS = ["辣", "麻", "椒", "香锅", "冒菜", "螺蛳", "水煮", "剁
 RESULTS = []
 
 
-def record(no, name, ok, detail=""):
-    RESULTS.append((no, name, ok, detail))
-    print("  [%s] #%s %s" % ("PASS" if ok else "FAIL", no, name))
+def record(no, name, ok, detail="", skip=False):
+    RESULTS.append((no, name, ok, detail, skip))
+    print("  [%s] #%s %s" % ("SKIP" if skip else ("PASS" if ok else "FAIL"), no, name))
     if detail:
         for line in str(detail).splitlines():
             print("        " + line)
@@ -179,6 +179,7 @@ def case4():
 def case5():
     """AI 报 price=999：接口必须返回数据库真实价格"""
     q = "想吃黄焖鸡"
+    purge(q)
     fake = json.dumps([{"dish": "黄焖鸡米饭(大份)", "window": "黄焖鸡",
                         "loc": "九食堂9楼", "price": 999, "score": 9.9,
                         "reason": "肉多"}], ensure_ascii=False)
@@ -197,6 +198,7 @@ def case5():
 def case6():
     """菜名不存在：该条丢弃，用本地补齐到 3 条"""
     q = "想吃点热的"
+    purge(q)
     fake = json.dumps([{"dish": "不存在的菜", "window": "不存在",
                         "loc": "零食堂", "price": 1, "score": 5, "reason": "编的"}],
                       ensure_ascii=False)
@@ -238,7 +240,8 @@ def case9():
     import importlib
     importlib.reload(teleagent_client)
     if not teleagent_client.engine_available():
-        record(9, "真实引擎冒烟（跳过：TeleAgent 未运行）", True, "engine_available=False")
+        record(9, "真实引擎冒烟（TeleAgent 未运行）", True,
+               "engine_available=False，本条未验证", skip=True)
         return
     q = "想吃点酸的，开胃"
     purge(q)
@@ -267,18 +270,47 @@ def case10():
            "status=%s %.2fs note=%r items=%d" % (status, dt, done.get("note"), len(items)))
 
 
+def case11():
+    """缓存里的旧价格必须被数据库纠正（P0-3a 回归，验收报告要求新增）"""
+    import sqlite3
+    q = "想吃黄焖鸡"
+    purge(q)
+    appmod._AI_CACHE.clear()
+    conn = sqlite3.connect(os.path.join(BASE, "canteen.db"))
+    appmod._ensure_ai_answers(conn)
+    stale = [{"dish": "黄焖鸡米饭(大份)", "window": "黄焖鸡", "loc": "九食堂9楼",
+              "price": 999, "score": 9.9, "reason": "旧缓存", "intro": ""}]
+    conn.execute("INSERT OR REPLACE INTO ai_answers(q,items,engine,created_at) VALUES (?,?,?,?)",
+                 (q, json.dumps(stale, ensure_ascii=False), "engine", "2026-10-24 00:00:00"))
+    conn.commit()
+    conn.close()
+
+    local_off()
+    status, events = sse(q)
+    done = get_done(events)
+    items = done.get("items") or []
+    prices = [i.get("price") for i in items]
+    ok = (status == 200 and bool(items)
+          and all(p != 999 for p in prices)
+          and all(p is not None and 0 < p <= 100 for p in prices))
+    record(11, "缓存旧价被数据库纠正", ok,
+           "status=%s note=%r prices=%s" % (status, done.get("note"), prices))
+
+
 def main():
     print("=" * 62)
     print("智慧食堂 · AI 后端回归测试")
     print("=" * 62)
-    for fn in [case1, case2, case3, case4, case5, case6, case7, case8, case9, case10]:
+    for fn in [case1, case2, case3, case4, case5, case6, case7, case8, case9, case10, case11]:
         try:
             fn()
         except Exception as e:
             record(fn.__name__, fn.__name__ + " 异常", False, repr(e))
     print("-" * 62)
-    passed = sum(1 for r in RESULTS if r[2])
-    print("合计 %d 项：通过 %d，失败 %d" % (len(RESULTS), passed, len(RESULTS) - passed))
+    passed = sum(1 for r in RESULTS if r[2] or r[4])
+    skipped = sum(1 for r in RESULTS if r[4])
+    print("合计 %d 项：通过 %d，失败 %d，跳过 %d" % (
+        len(RESULTS), passed - skipped, len(RESULTS) - passed, skipped))
     return 0 if passed == len(RESULTS) else 1
 
 
