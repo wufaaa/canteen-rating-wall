@@ -14,6 +14,7 @@ import re
 import secrets
 import sqlite3
 import string
+import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
@@ -912,20 +913,98 @@ def _ai_data_summary_fast(conn, q):
     return "\n".join(parts)
 
 
-def _ai_compact_prompt(conn, q, limit=12):
-    """极速提示词：只给最相关的 12 道候选，输出要求压到最短（约 400 字）。"""
+def _window_comments(conn, wids, per=1, cut=24):
+    """给候选窗口各取 1 条点赞最高的评论，作为模型写理由的素材"""
+    out = {}
+    if not wids:
+        return out
+    marks = ",".join("?" * len(wids))
+    rows = conn.execute(
+        "SELECT p.window_id AS wid, p.content, "
+        "       (SELECT COUNT(*) FROM post_likes pl WHERE pl.post_id=p.id) AS likes "
+        "FROM posts p WHERE p.status=1 AND p.window_id IN (%s) "
+        "ORDER BY likes DESC, p.created_at DESC" % marks, list(wids)).fetchall()
+    for r in rows:
+        bucket = out.setdefault(r["wid"], [])
+        if len(bucket) < per:
+            bucket.append((r["content"] or "").strip()[:cut])
+    return out
+
+
+def _canteen_profile(conn, wids=None, per=3):
+    """把食堂压成一份「档案」：每个窗口一行，含位置、均分、价位、招牌菜。
+
+    这是让模型「看到全库」的正确姿势 —— 实测：
+      全量 244 道菜（6215 字）→ 19.5 秒，还会编菜名；
+      72 个窗口档案（3251 字）→ 5.0 秒，且能搭出「主食+配菜+甜品」。
+    """
     import ai_local
-    cands = ai_local.recommend(conn, q, limit=limit)
-    if not cands:
+    sql = """
+        SELECT w.id, w.name, w.canteen, w.floor,
+               ROUND(AVG(r.score),2) AS a,
+               MIN(d.price) AS pmin, MAX(d.price) AS pmax
+        FROM windows w
+        LEFT JOIN ratings r ON r.window_id=w.id AND strftime('%Y-%m', r.date)=?
+        LEFT JOIN dishes d ON d.window_id=w.id AND d.status=1
+        WHERE w.status=1
+        GROUP BY w.id
+    """
+    params = [this_month()]
+    if wids:
+        sql += " HAVING w.id IN (%s)" % ",".join("?" * len(wids))
+        params += list(wids)
+    sql += " ORDER BY a DESC, w.id"
+    rows = conn.execute(sql, params).fetchall()
+    warns = ai_local.window_warnings(conn)
+
+    lines = []
+    for r in rows:
+        dishes = [x[0] for x in conn.execute(
+            "SELECT name FROM dishes WHERE window_id=? AND status=1 ORDER BY id LIMIT ?",
+            (r["id"], per))]
+        if not dishes:
+            continue
+        price = ("%g-%g元" % (r["pmin"], r["pmax"])) if r["pmin"] is not None else "暂无价"
+        warn = warns.get(r["id"]) or []
+        lines.append("%s（%s食堂%d楼）均分%s %s 招牌:%s%s" % (
+            r["name"], ai_local.canteen_name(r["canteen"]), r["floor"],
+            r["a"] or "暂无", price, "/".join(dishes),
+            (" ⚠" + "/".join(warn[:2])) if warn else ""))
+    return lines
+
+
+def _ai_compact_prompt(conn, q, limit=12):
+    """提示词：把食堂压成「全窗口档案」给模型，让它看得到全局再自己搭一顿饭。
+
+    有明确意图时只给相关窗口（更快）；没有意图时给全部 72 个窗口（约 3.2k 字 / 5 秒）。
+    """
+    import ai_local
+    intent = ai_local.parse_intent(q)
+    wids = None
+    if intent:
+        try:
+            cands = ai_local.recommend(conn, q, limit=40)
+            wids = {c["window_id"] for c in cands if c.get("window_id")} or None
+        except Exception as e:
+            print("[ai] 意图筛窗口失败：%r" % e, flush=True)
+
+    profile = _canteen_profile(conn, wids, per=2)
+    if not profile:
         return _ai_prompt(q, _ai_data_summary_fast(conn, q), fast=True)
-    lines = ["菜名|窗口|位置|价|评分"]
-    for c in cands:
-        lines.append("%s|%s|%s|%s|%s" % (
-            c["dish"], c["window"], c["loc"], c["price"], c.get("score") or "-"))
-    return ("从下列菜品里挑3个最适合「%s」的，只输出JSON数组：\n"
-            '[{"dish":"","window":"","loc":"","price":0,'
-            '"reason":"推荐理由20字内","intro":"菜品介绍30字内"}]\n%s'
-            % (q, "\n".join(lines)))
+
+    scope = ("全部 %d 个窗口" % len(profile)) if wids is None else ("与需求相关的 %d 个窗口" % len(profile))
+    return (
+        "下面是本校食堂%s（含招牌菜、价位、本月均分）。\n" % scope +
+        "\n".join(profile) +
+        "\n\n学生说：「%s」\n" % q +
+        "选3个搭成一顿饭：至少1个主食（饭/面/饺子），可配汤/小菜/甜品，别3个同类，不同窗口优先。"
+        "带 ⚠ 的窗口有学生差评，能避开就避开；避不开就在 reason 里提醒一句。"
+        "reason 要写具体依据（评分、价位、招牌特点、差评），20字内。\n"
+        "好理由示例：「4.33分，红油够辣」「9元，卤味分量足」「⚠排队久，赶时间别选」\n"
+        "坏理由示例：「评分高」「强烈推荐」「符合口味」——这种一律不要写。\n"
+        "dish 必须原样照抄档案里的菜名，不要改写。"
+        '只输出JSON数组：[{"dish":"","window":"","loc":"","price":0,"reason":"","intro":""}]'
+    )
 
 
 def _ai_prompt(q, summary, fast=False):
@@ -955,12 +1034,23 @@ def _parse_ai_items(text):
     if "```" in t:  # 剥 markdown 围栏
         t = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", t.strip(), flags=re.M).strip()
     m = re.search(r"\[[\s\S]*\]", t)
-    if not m:
-        return []
+    if m:
+        body = m.group(0)
+    else:
+        i = t.find("[")                 # 模型有时把数组截断，先截到 [ 再修
+        if i < 0:
+            return []
+        body = t[i:]
     try:
-        arr = _json.loads(m.group(0))
+        arr = _json.loads(body)
     except Exception:
-        return []
+        j = body.rfind("}")             # 截断修复：补到最后一个完整对象
+        if j < 0:
+            return []
+        try:
+            arr = _json.loads(body[:j + 1] + "]")
+        except Exception:
+            return []
     items = []
     if isinstance(arr, list):
         for a in arr:
@@ -995,6 +1085,7 @@ def _attach_dish_info(conn, items):
     """AI 只负责「选哪道菜 + 写理由」；价格/窗口/位置/评分一律以数据库为准。
     菜名在库里对不上就丢弃，绝不把 AI 编的价格放给前端。"""
     import ai_local
+    warns = ai_local.window_warnings(conn)
     fixed = []
     for it in items or []:
         name = (it.get("dish") or "").strip()
@@ -1024,6 +1115,7 @@ def _attach_dish_info(conn, items):
             it["photo"] = row["photo"]
         if row["intro"]:
             it["intro"] = row["intro"][:80]
+        it["warn"] = "、".join(warns.get(row["wid"], [])[:2])
         fixed.append(it)
         if len(fixed) >= 3:
             break
@@ -1086,6 +1178,66 @@ def _local_fallback_items(conn, q, want=3):
             "dish_id": r["did"], "window_id": r["wid"],
         })
     return out
+
+
+# 结果缓存：同一句话 10 分钟内再问，直接给上次大模型想好的结果。
+# 模型服务本身波动很大（同一提示词 7~17 秒），演示时重复提问不该再等一遍。
+_AI_CACHE = {}
+_AI_CACHE_TTL = 600
+
+
+def _cache_get(q):
+    hit = _AI_CACHE.get(q)
+    if hit and time.time() - hit[0] < _AI_CACHE_TTL:
+        return hit[1]
+    return None
+
+
+def _cache_put(q, items):
+    if not items:
+        return
+    _AI_CACHE[q] = (time.time(), items)
+    if len(_AI_CACHE) > 200:                 # 简单淘汰，删最早的一批
+        for k in list(_AI_CACHE)[:50]:
+            _AI_CACHE.pop(k, None)
+
+
+def _ensure_ai_answers(conn):
+    """预生成答案表：重启后仍命中，演示时高频问题秒回。"""
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ai_answers(
+                q TEXT PRIMARY KEY,
+                items TEXT NOT NULL,
+                engine TEXT NOT NULL DEFAULT 'engine',
+                created_at TEXT NOT NULL
+            )""")
+    except Exception as e:
+        print("[ai] 建 ai_answers 表失败：%r" % e, flush=True)
+
+
+def _answer_get(conn, q):
+    import json as _json
+    try:
+        _ensure_ai_answers(conn)
+        row = conn.execute("SELECT items FROM ai_answers WHERE q=?", (q,)).fetchone()
+        if row:
+            return _json.loads(row["items"])
+    except Exception as e:
+        print("[ai] 读预生成答案失败：%r" % e, flush=True)
+    return None
+
+
+def _answer_put(conn, q, items):
+    import json as _json
+    if not items:
+        return
+    try:
+        _ensure_ai_answers(conn)
+        conn.execute("INSERT OR REPLACE INTO ai_answers(q, items, engine, created_at) VALUES (?,?,?,?)",
+                     (q, _json.dumps(items, ensure_ascii=False), "engine", now()))
+    except Exception as e:
+        print("[ai] 写预生成答案失败：%r" % e, flush=True)
 
 
 def _ai_cloud_fast(q, summary, timeout=8):
@@ -1202,7 +1354,7 @@ def _run_engine_job(job_id, prompt, q=""):
     try:
         import teleagent_client
         model = os.environ.get("AI_ENGINE_MODEL", "chat-lite")
-        answer = teleagent_client.engine_ask(prompt, model=model, timeout=12)
+        answer = teleagent_client.engine_ask(prompt, model=model, timeout=18)
         items = _parse_ai_items(answer)
         if items:
             with get_db() as c:
@@ -1333,6 +1485,20 @@ def api_ai_stream():
             return "event: %s\ndata: %s\n\n" % (evt, _json.dumps(payload, ensure_ascii=False))
 
         yield send("local", {"items": local_items})
+        # 同一句话问过：内存缓存 → 预生成表，都不再等模型
+        cached = _cache_get(q)
+        if not cached:
+            try:
+                with get_db() as c:
+                    cached = _answer_get(c, q)
+            except Exception:
+                cached = None
+            if cached:
+                _cache_put(q, cached)
+        if cached:
+            print("[ai] stream: cache hit", flush=True)
+            yield send("done", {"items": cached, "engine": "engine", "note": "cached"})
+            return
         if not prompt:
             print("[ai] stream: prompt unavailable, local only", flush=True)
             yield send("done", {"items": local_items, "engine": "local",
@@ -1350,7 +1516,7 @@ def api_ai_stream():
         buf = ""
         model = os.environ.get("AI_ENGINE_MODEL", "chat-lite")
         try:
-            for chunk in teleagent_client.engine_stream(prompt, model=model, timeout=12):
+            for chunk in teleagent_client.engine_stream(prompt, model=model, timeout=25):
                 if chunk["type"] == "delta":
                     if chunk.get("part") == "text":
                         buf += chunk["text"]
@@ -1368,6 +1534,12 @@ def api_ai_stream():
                         with get_db() as c:
                             items = _finalize_ai_items(c, items, q)
                         if items:
+                            _cache_put(q, items)
+                            try:
+                                with get_db() as c:
+                                    _answer_put(c, q, items)
+                            except Exception:
+                                pass
                             yield send("done", {"items": items, "engine": "engine"})
                             return
                     yield send("done", {"items": local_items, "engine": "local",

@@ -1,4 +1,4 @@
-/* ============================================================ 食堂评分墙 —— 前端 SPA（原生 JS，零依赖） */
+﻿/* ============================================================ 食堂评分墙 —— 前端 SPA（原生 JS，零依赖） */
 "use strict";
 
 const $ = (s, p) => (p || document).querySelector(s);
@@ -9,8 +9,10 @@ function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
-const CN = ["一", "二", "三"];
-function loc(w) { return `${CN[w.canteen - 1]}食堂 ${w.floor === 1 ? "一" : "二"}楼 ${String(w.win_no).padStart(2, "0")}号`; }
+const CN = ["一", "二", "三", "四"];
+const CANTEEN_NAMES = { 4: "第四食堂（东油饺子园）" };
+function cname(c) { return CANTEEN_NAMES[c] || (CN[c - 1] + "食堂"); }
+function loc(w) { return `${cname(w.canteen)} ${w.floor === 1 ? "一" : "二"}楼 ${String(w.win_no).padStart(2, "0")}号`; }
 
 function fmtTime(t) {
   const d = new Date(t.replace(" ", "T"));
@@ -61,6 +63,7 @@ const ICONS = {
   info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>',
   flame: '<path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/>',
   thumbsUp: '<path d="M7 10v12"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z"/>',
+  thumbsDown: '<path d="M17 14V2"/><path d="M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88Z"/>',
   clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
   key: '<path d="m21 2-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4"/>',
   restore: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>',
@@ -168,6 +171,8 @@ const S = {
   countdownTimer: null,
   postPhotoFile: null,
   searchQ: "",
+  prevRoute: null,     // 上一个路由（返回键用）
+  _routed: false,
 };
 
 /* ------------------------------------------------------------ 顶栏 */
@@ -185,6 +190,7 @@ function renderTopbar() {
   } else {
     nav = `<a href="#/leaderboard" class="${route === "leaderboard" ? "active" : ""}">${icon("trophy")} 榜单</a>
            <a href="#/canteens" class="${route === "canteens" ? "active" : ""}">${icon("grid")} 食堂</a>
+           <a href="#/avoid" class="${route === "avoid" ? "active" : ""}">${icon("alert")} 避雷</a>
            <a href="#/my" class="${route === "my" ? "active" : ""}">${icon("user")} 我的</a>`;
   }
   $("#mainNav").innerHTML = nav;
@@ -233,6 +239,7 @@ function renderTabbar(role, route) {
     items = [
       { href: "#/leaderboard", key: "leaderboard", ic: "trophy", text: "榜单" },
       { href: "#/canteens", key: "canteens", ic: "grid", text: "食堂" },
+      { href: "#/avoid", key: "avoid", ic: "alert", text: "避雷" },
       { href: "#/my", key: "my", ic: "user", text: "我的" },
     ];
   }
@@ -254,6 +261,7 @@ async function refreshBoot() {
 async function renderLeaderboard() {
   const month = S.lbMonth || (S.boot ? S.boot.this_month : null);
   const r = await api("/api/leaderboard" + (month ? "?month=" + month : ""));
+  const wr = await api("/api/warnings");
   if (!r.ok) { $("#view").innerHTML = `<div class="empty">${icon("alert")} ${esc(r.msg)}</div>`; return; }
   const d = r.data;
   S.lbMonth = d.month;
@@ -346,6 +354,13 @@ async function renderLeaderboard() {
       ${runners.length ? `<div class="runners">${runnerHtml}</div>` : ""}
     </div>
 
+    <div class="avoid-banner" data-act="go-avoid">
+      <div>${icon("alert")} <b>差评避雷</b> · ${wr.ok && wr.data.month_bad_cnt
+        ? `本月已有 <b>${wr.data.month_bad_cnt}</b> 条差评、涉及 <b>${wr.data.window_cnt}</b> 个窗口，选窗口前先看看`
+        : `本月暂无差评，欢迎大家有理有据地反馈问题`}</div>
+      ${icon("chevronRight")}
+    </div>
+
     ${posterHtml}
 
     <div class="card rank-2col" style="padding:8px 10px;margin-top:14px">
@@ -385,15 +400,17 @@ async function renderCanteens() {
   const d = r.data;
   const sel = S.winSel;
   const todayRated = new Set(d.today_rated || []);
-  const canteenTabs = [1, 2, 3].map(c => {
+  const canteenTabs = [1, 2, 3, 4].map(c => {
     const wins = d.windows.filter(w => w.canteen === c);
     const on = wins.filter(w => w.status === 1).length;
     return `<div class="ctab ${sel.canteen === c ? "active" : ""}" data-act="sel-canteen" data-v="${c}">
       <div class="ci">${CN[c - 1]}</div>
-      <div><div class="cn">${CN[c - 1]}食堂</div><div class="cs">营业中 ${on}/20 窗口</div></div></div>`;
+      <div><div class="cn">${cname(c)}</div><div class="cs">营业中 ${on}/${wins.length} 窗口</div></div></div>`;
   }).join("");
-  const floorTabs = [1, 2].map(f =>
-    `<button class="${sel.floor === f ? "active" : ""}" data-act="sel-floor" data-v="${f}">${f === 1 ? "一楼" : "二楼"}</button>`).join("");
+  const floors = [...new Set(d.windows.filter(w => w.canteen === sel.canteen).map(w => w.floor))].sort();
+  if (!floors.includes(sel.floor)) sel.floor = floors[0] || 1;
+  const floorTabs = floors.map(f =>
+    `<button class="${sel.floor === f ? "active" : ""}" data-act="sel-floor" data-v="${f}">${f === 1 ? "一楼" : f === 2 ? "二楼" : f + "楼"}</button>`).join("");
   const wins = d.windows.filter(w => w.canteen === sel.canteen && w.floor === sel.floor);
   const cards = wins.map(w => {
     const rated = todayRated.has(w.id);
@@ -411,7 +428,7 @@ async function renderCanteens() {
 
   $("#view").innerHTML = `
     <div class="page-head"><div><h1>${icon("grid")} 食堂窗口</h1>
-      <div class="sub">3 个食堂 · 每个食堂 2 层 · 每层 10 个窗口 · 今日剩余 ${d.quota_left} 次打分机会</div></div></div>
+      <div class="sub">4 个食堂 · 今日剩余 ${d.quota_left} 次评价机会</div></div></div>
     <div class="search-bar">
       <span class="sb-ico">${icon("search")}</span>
       <input id="winSearch" type="search" placeholder="搜窗口名、菜品，如「清真」「麻辣香锅」「12」" value="${esc(S.searchQ || "")}" autocomplete="off" spellcheck="false">
@@ -487,6 +504,33 @@ async function doSearch(q, immediate) {
     <div class="search-list">${list}</div>`;
 }
 
+/* ------------------------------------------------------------ 自选餐档口 */
+const BUFFET_TIPS = [
+  ["👍 看好评数", "菜品按好评数排序，好评多的基本不踩雷；差评多的先看看讨论区的差评理由再决定"],
+  ["🥗 荤素搭配", "一荤 + 一半荤 + 一素，好吃不贵营养全；重口味菜配清淡绿叶菜"],
+  ["⏰ 挑时间", "饭点前 10 分钟到档口，菜品刚补齐最新鲜；临近打烊的菜可能已回锅多次"],
+  ["👁 看色泽", "菜叶发黄、肉色发暗、汤汁浑浊的要谨慎；现炒的菜有镆气"],
+  ["📝 会评价", "吃到好菜给个好评鼓励商家；踩雷了差评要有理有据（哪道菜、什么问题），每人每菜每天一票"],
+];
+
+function buffetDishHtml(dh) {
+  const myGood = dh.my_vote === "good", myBad = dh.my_vote === "bad";
+  return `
+    <div class="buffet-dish ${myGood || myBad ? "voted" : ""}">
+      <div class="bd-main">
+        <div class="bd-name">${esc(dh.name)}<span class="bd-price">¥${dh.price.toFixed ? dh.price.toFixed(1) : dh.price}</span>
+          ${myGood ? '<span class="post-cat good">我评的好评</span>' : myBad ? '<span class="post-cat bad">我评的差评</span>' : ""}</div>
+        <div class="bd-intro">${esc(dh.intro) || '<span class="faint">商家暂未填写简介</span>'}</div>
+      </div>
+      <div class="bd-vote">
+        <button class="bd-btn good ${myGood ? "on" : ""}" data-act="dish-vote" data-id="${dh.id}" data-v="good"
+          title="这道菜好评，点击投票">${icon("thumbsUp")} <b>${dh.good_cnt || 0}</b></button>
+        <button class="bd-btn bad ${myBad ? "on" : ""}" data-act="dish-vote" data-id="${dh.id}" data-v="bad"
+          title="这道菜差评，点击投票">${icon("thumbsDown")} <b>${dh.bad_cnt || 0}</b></button>
+      </div>
+    </div>`;
+}
+
 /* ------------------------------------------------------------ 窗口详情页 */
 async function renderWindow(id) {
   const [wr, pr] = await Promise.all([api("/api/windows/" + id), api("/api/windows/" + id + "/posts")]);
@@ -496,7 +540,33 @@ async function renderWindow(id) {
   const closed = w.status !== 1;
   const canRate = !closed && d.my_today_score == null && d.quota_left > 0;
 
-  const dishes = d.dishes.map(dh => `
+  const buffet = !!w.is_buffet;
+  let dishes = "", buffetStallHtml = "";
+  if (buffet) {
+    const order = ["自选麻辣烫", "自选菜"];
+    const groups = [], gmap = {};
+    d.dishes.forEach(dh => {
+      const s = dh.stall || "自选菜";
+      if (!gmap[s]) { gmap[s] = []; groups.push({ name: s, list: gmap[s] }); }
+      gmap[s].push(dh);
+    });
+    groups.sort((a, b) => {
+      const ia = order.indexOf(a.name), ib = order.indexOf(b.name);
+      return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+    });
+    buffetStallHtml = groups.map(g => {
+      const list = [...g.list].sort((a, b) => (b.good_cnt || 0) - (a.good_cnt || 0) || (a.bad_cnt || 0) - (b.bad_cnt || 0) || a.id - b.id);
+      const sg = list.reduce((s, x) => s + (x.good_cnt || 0), 0);
+      const sb = list.reduce((s, x) => s + (x.bad_cnt || 0), 0);
+      return `
+      <div class="stall-block">
+        <div class="stall-head"><span class="stall-name">${icon("store")} ${esc(g.name)}</span>
+          <span class="stall-sum">好评 <b class="good-num">${sg}</b> · 差评 <b class="${sb ? "bad-num" : ""}">${sb}</b></span></div>
+        ${list.map(dh => buffetDishHtml(dh)).join("")}
+      </div>`;
+    }).join("");
+  } else {
+    dishes = d.dishes.map(dh => `
     <div class="dish-card">
       <div class="dish-photo">${dh.photo ? `<img src="/uploads/${esc(dh.photo)}" alt="${esc(dh.name)}">`
         : `<div class="ph">${icon("image")}</div>`}</div>
@@ -506,6 +576,10 @@ async function renderWindow(id) {
         <div class="dish-updated">更新于 ${fmtDate(dh.updated_at)}</div>
       </div>
     </div>`).join("");
+  }
+
+  const buffetSumGood = d.dishes.reduce((s, x) => s + (x.good_cnt || 0), 0);
+  const buffetSumBad = d.dishes.reduce((s, x) => s + (x.bad_cnt || 0), 0);
 
   const dishOpts = ['<option value="">不关联菜品</option>']
     .concat(d.dishes.map(x => `<option value="${x.id}">${esc(x.name)}</option>`)).join("");
@@ -514,43 +588,66 @@ async function renderWindow(id) {
   if (closed) {
     rateBox = `<span class="pill gray">${icon("info")} 窗口已停用，暂不能打分</span>`;
   } else if (d.my_today_score != null) {
-    rateBox = `<span class="pill ok">${icon("check")} 今天已打 ${d.my_today_score} 星，明天再来</span>`;
+    const myCat = d.my_today_score >= 4 ? "好评 👍" : "差评 👎";
+    rateBox = `<span class="pill ok">${icon("check")} 今天已评价：${myCat}，明天再来</span>`;
   } else if (d.quota_left <= 0) {
-    rateBox = `<span class="pill warn">${icon("timer")} 今日 3 次打分机会已用完</span>`;
+    rateBox = `<span class="pill warn">${icon("timer")} 今日 3 次评价机会已用完</span>`;
   } else {
-    rateBox = `<div class="rate-box" id="rateBox">${[1, 2, 3, 4, 5].map(i =>
-      `<button data-act="rate-star" data-v="${i}" title="${i} 星">${icon("star", "s" + i)}</button>`).join("")}</div>
-      <div class="rate-tip">点击星星打分（1~5 星）· 今天还能给 <b>${d.quota_left}</b> 个窗口打分</div>`;
+    rateBox = `<div class="rate-btns">
+      <button class="rate-btn good" data-act="rate-good" title="好评，点击即提交">${icon("thumbsUp")} 好评</button>
+      <button class="rate-btn bad" data-act="rate-bad" title="差评，需填写理由">${icon("thumbsDown")} 差评</button>
+    </div>
+    <div class="rate-tip">好评点击即提交；差评需填写理由，<b>有理有据</b>的反馈才能帮食堂改进 · 今天还能评价 <b>${d.quota_left}</b> 个窗口</div>`;
   }
 
   const posts = pr.ok ? pr.data.posts : [];
   const postHtml = posts.map(p => postHtml_(p)).join("");
 
   $("#view").innerHTML = `
-    <div class="crumb"><span data-act="go-canteens" class="link">${icon("grid")} 食堂</span>
+    <div class="crumb">
+      <button class="btn btn-ghost btn-sm btn-back" data-act="go-back" title="返回上一页">${icon("back")} 返回</button>
+      <span class="crumb-sep"></span>
+      <span data-act="go-canteens" class="link">${icon("grid")} 食堂</span>
       ${icon("chevronRight")} <span>${loc(w)}</span></div>
     <div class="card" style="margin-bottom:14px">
       <div class="win-head">
-        <div><h2>${icon("utensils")} ${esc(w.name)} ${closed ? '<span class="tag off">已停用</span>' : ""}
+        <div><h2>${icon("utensils")} ${esc(w.name)} ${buffet ? '<span class="pill">自选餐档口</span>' : ""} ${closed ? '<span class="tag off">已停用</span>' : ""}
           ${w.rank ? `<span class="rank-badge" style="position:static;display:inline-flex;vertical-align:middle;margin-top:4px">本月 #${w.rank}</span>` : ""}</h2>
           <div class="wm">${loc(w)} · 商家：${esc(w.merchant_name)}</div></div>
         <div class="win-stats">
           <div class="ws-item"><div class="v">${w.avg_score != null ? w.avg_score.toFixed(1) : "—"}</div><div class="l">本月均分 ${stars(w.avg_score)}</div></div>
           <div class="ws-item"><div class="v">${w.month_cnt}</div><div class="l">本月评分人数</div></div>
+          <div class="ws-item"><div class="v good-num">${w.good_cnt || 0}</div><div class="l">本月好评</div></div>
+          <div class="ws-item"><div class="v ${w.bad_cnt ? "bad-num" : ""}">${w.bad_cnt || 0}</div><div class="l">本月差评</div></div>
           <div class="ws-item"><div class="v">${w.total_cnt}</div><div class="l">累计评分</div></div>
           <div class="ws-item"><div class="v">${w.post_cnt}</div><div class="l">讨论帖</div></div>
         </div>
       </div>
       <div class="rate-panel">${rateBox}</div>
     </div>
-    <div class="sec-title">${icon("utensils")} 今日菜品 <span class="cnt">（价格以商家当日发布为准）</span></div>
-    <div class="dish-grid">${dishes || `<div class="empty" style="grid-column:1/-1">${icon("utensils")} 商家还未上架菜品</div>`}</div>
+    ${buffet ? `
+    <div class="card tips-card">
+      <div class="tips-title">${icon("info")} 选菜技巧 <span class="cnt">（自选餐档口专用）</span></div>
+      <div class="tips-list">${BUFFET_TIPS.map(t => `<div class="tip-item"><b>${t[0]}</b><span>${t[1]}</span></div>`).join("")}</div>
+      <div class="tips-sum">本档口累计收到好评 <b class="good-num">${buffetSumGood}</b> · 差评 <b class="${buffetSumBad ? "bad-num" : ""}">${buffetSumBad}</b>，你的投票会直接帮同学选菜、帮档口改进</div>
+    </div>` : ""}
+    <div class="sec-title">${icon("utensils")} ${buffet
+      ? `自选菜品 <span class="cnt">（按档口分组 · 组内按好评数排序 · 点 👍👎 帮同学选菜，每人每菜每天一票）</span>`
+      : `今日菜品 <span class="cnt">（价格以商家当日发布为准）</span>`}</div>
+    ${buffet
+      ? (buffetStallHtml || `<div class="empty">${icon("utensils")} 商家还未上架菜品</div>`)
+      : `<div class="dish-grid">${dishes || `<div class="empty" style="grid-column:1/-1">${icon("utensils")} 商家还未上架菜品</div>`}</div>`}
     <div class="sec-title">${icon("message")} 匿名讨论区 <span class="cnt">（发帖无需登录、不显示任何真实信息）</span></div>
     ${closed ? "" : `
     <div class="card post-box">
       <textarea id="postContent" maxlength="500" placeholder="说说这家窗口的味道、分量、排队情况…（匿名发布）"></textarea>
       <div id="postPhotoPreview"></div>
       <div class="post-tools">
+        <select id="postCat" title="评论类别">
+          <option value="">讨论</option>
+          <option value="good">好评</option>
+          <option value="bad">差评</option>
+        </select>
         <select id="postDish">${dishOpts}</select>
         <label class="photo-pick" id="postPhotoPick">${icon("camera")} <span>加张照片</span>
           <input type="file" id="postPhotoInput" accept="image/*"></label>
@@ -585,7 +682,9 @@ function postHtml_(p, isReply) {
   return `
   <div class="post" data-pid="${p.id}">
     <div class="post-head"><span class="avatar">${esc(initial)}</span>
-      <div><span class="post-nick">${nick}</span> <span class="post-time">${fmtTime(p.created_at)}</span></div></div>
+      <div><span class="post-nick">${nick}</span>
+        ${p.category === "bad" ? '<span class="post-cat bad">差评</span>' : p.category === "good" ? '<span class="post-cat good">好评</span>' : ""}
+        <span class="post-time">${fmtTime(p.created_at)}</span></div></div>
     ${p.dish ? `<div class="dish-tag">${icon("utensils")} ${esc(p.dish.name)}（¥${p.dish.price}）</div>` : ""}
     <div class="post-content">${esc(p.content)}</div>
     ${p.photo ? `<img class="post-photo" src="/uploads/${esc(p.photo)}" alt="留言照片" loading="lazy"
@@ -625,13 +724,13 @@ async function renderMy() {
   const initial = d.nickname ? d.nickname.slice(0, 1) : "匿";
   const ratings = d.ratings.map(x => `
     <div class="rank-row" data-act="go-window" data-id="${x.window_id}">
-      <div class="rank-no">${x.score}★</div>
+      <div class="rank-no ${x.score >= 4 ? "good" : "bad"}">${x.score >= 4 ? "好评" : "差评"}</div>
       <div class="rank-main"><div class="rn">${esc(x.window_name)}</div><div class="rl">${loc(x)}</div></div>
       <div class="rank-cnt">${x.date}</div>${icon("chevronRight")}</div>`).join("");
   const posts = d.posts.map(x => `
     <div class="rank-row" data-act="go-window" data-id="${x.window_id}">
       <div class="rank-no">${icon(x.parent_id ? "reply" : "message")}</div>
-      <div class="rank-main"><div class="rn" style="font-weight:400;font-size:13px">${esc(x.content)}</div>
+      <div class="rank-main"><div class="rn" style="font-weight:400;font-size:13px">${x.category === "bad" ? '<span class="post-cat bad">差评</span> ' : x.category === "good" ? '<span class="post-cat good">好评</span> ' : ""}${esc(x.content)}</div>
         <div class="rl">${esc(x.window_name)} · ${fmtTime(x.created_at)}</div></div></div>`).join("");
   $("#view").innerHTML = `
     <div class="page-head"><div><h1>${icon("user")} 我的</h1></div>
@@ -665,11 +764,47 @@ async function renderMy() {
     </div>`;
 }
 
+/* ------------------------------------------------------------ 差评避雷页 */
+async function renderAvoid() {
+  const r = await api("/api/warnings");
+  if (!r.ok) { $("#view").innerHTML = `<div class="empty">${icon("alert")} ${esc(r.msg)}</div>`; return; }
+  const d = r.data;
+  const items = d.items || [];
+  $("#view").innerHTML = `
+    <div class="page-head"><div><h1>${icon("alert")} 差评避雷</h1>
+      <div class="sub">集中收录全食堂差评 · 选窗口前先看看，少踩雷</div></div></div>
+    <div class="card warn-notice">
+      <b>${icon("info")} 差评须知：</b>不要随意差评。差评要有理有据地说明情况（哪道菜、什么问题、什么时间），平台<b>支持合理差评</b>——它是食堂改进的重要依据；恶意差评、情绪化攻击将被管理员删除处理。
+    </div>
+    <div class="stat-grid">
+      <div class="stat-card"><div class="sv">${d.month_bad_cnt}</div><div class="sl">${icon("flag")} 本月差评数</div></div>
+      <div class="stat-card"><div class="sv">${d.window_cnt}</div><div class="sl">${icon("store")} 涉及窗口数</div></div>
+    </div>
+    ${(d.top_windows || []).length ? `
+    <div class="sec-title">${icon("flame")} 本月差评最多的窗口</div>
+    <div class="card" style="padding:8px 10px">${d.top_windows.map(w => `
+      <div class="rank-row" data-act="go-window" data-id="${w.id}">
+        <div class="rank-no bad">${w.bad_cnt}</div>
+        <div class="rank-main"><div class="rn">${esc(w.name)}</div><div class="rl">${loc(w)}</div></div>
+        <div class="rank-cnt">${w.bad_cnt} 条差评</div>${icon("chevronRight")}</div>`).join("")}</div>` : ""}
+    <div class="sec-title">${icon("message")} 最新差评</div>
+    ${items.map(p => `
+      <div class="card avoid-item" data-act="go-window" data-id="${p.window_id}">
+        <div class="ai-head"><span class="post-cat bad">差评</span>
+          <b>${esc(p.window_name)}</b><span class="rl">${loc(p)}</span>
+          <span class="ai-time">${fmtTime(p.created_at)}</span></div>
+        <div class="ai-content">${esc(p.content)}</div>
+        ${p.photo ? `<img class="ai-photo" src="/uploads/${esc(p.photo)}" alt="差评照片" loading="lazy">` : ""}
+        <div class="ai-foot"><span>${icon("thumbsUp")} ${p.likes}</span><span>${icon("message")} ${p.reply_count}</span><span>${icon("shield")} 匿名同学：${esc(p.nickname)}</span></div>
+      </div>`).join("") || `<div class="empty">${icon("check")} 本月还没有差评，都是好口碑</div>`}`;
+}
+
 /* ------------------------------------------------------------ 登录页 */
 function renderLogin(kind) {
   const isAdmin = kind === "admin";
   $("#view").innerHTML = `
     <div class="login-wrap"><div class="card">
+      <div class="login-back"><button class="btn btn-ghost btn-sm" data-act="go-back-login" title="返回上一页">${icon("back")} 返回</button></div>
       <h2>${icon(isAdmin ? "shield" : "store")} ${isAdmin ? "管理员登录" : "商家登录"}</h2>
       <div class="sub">${isAdmin ? "窗口管理 · 帖子审核 · 商家账号维护" : "管理本窗口的菜品、菜价与照片"}</div>
       <form id="loginForm">
@@ -891,10 +1026,12 @@ function dishFormModal(dish) {
 
 /* ------------------------------------------------------------ 路由 */
 function route() {
+  if (S._routed) S.prevRoute = S.route;   // 记录上一个页面，供返回键使用
+  S._routed = true;
   const h = location.hash || "#/leaderboard";
   const parts = h.replace(/^#\//, "").split("/");
   if (S.countdownTimer) { clearInterval(S.countdownTimer); S.countdownTimer = null; }
-  const map = { leaderboard: "leaderboard", canteens: "canteens", my: "my", admin: "admin", merchant: "merchant" };
+  const map = { leaderboard: "leaderboard", canteens: "canteens", my: "my", admin: "admin", merchant: "merchant", avoid: "avoid" };
   if (parts[0] === "window" && parts[1]) {
     S.route = "window";
     renderTopbar();
@@ -905,6 +1042,7 @@ function route() {
     if (S.route === "leaderboard") renderLeaderboard();
     else if (S.route === "canteens") renderCanteens();
     else if (S.route === "my") renderMy();
+    else if (S.route === "avoid") renderAvoid();
     else if (S.route === "admin") renderAdmin();
     else if (S.route === "merchant") renderMerchant();
   }
@@ -944,7 +1082,7 @@ function aiCardsHtml(items, t0) {
         <div class="ai-rank">${i + 1}</div>
         <div class="ai-main">
           <div class="ai-dish">${esc(it.dish)}<span class="ai-price">¥${it.price != null ? it.price : "-"}</span></div>
-          <div class="ai-meta">${esc(it.window)} · ${esc(it.loc)}${it.score != null ? ` · 评分 ${it.score}` : ""}</div>
+          <div class="ai-meta">${esc(it.window)} · ${esc(it.loc)}${it.score != null ? ` · 评分 ${it.score}` : ""}${it.warn && !(it.reason || "").includes("⚠") ? ` <span class="ai-warn" title="来自学生评论">⚠ ${esc(it.warn)}</span>` : ""}</div>
           <div class="ai-reason">${esc(it.reason)}</div>
           ${it.intro ? `<div class="ai-intro">${esc(it.intro)}</div>` : ""}
         </div>
@@ -1045,9 +1183,12 @@ async function askAi(preset) {
               aiCardsHtml(items) +
               `<div class="ai-foot">${icon("sparkles")} 大模型结合评分、评论、榜单的深度推荐</div>`;
           } else if (items.length) {
+            /* 大模型没成功时如实说明，别让学生以为是 AI 想的 */
+            const foot = data.note
+              ? `<div class="ai-foot" style="color:#b45309">${icon("info")} 大模型这次没返回（${esc(String(data.note).slice(0, 32))}），以下为本机推荐</div>`
+              : `<div class="ai-foot">${icon("cpu")} 本机推荐引擎（结合评分、评论、榜单，离线可用）</div>`;
             box.innerHTML = `<div class="ai-done">${aiBadgeHtml(eng)}<span class="ai-sec">${sec}s</span></div>` +
-              aiCardsHtml(items) +
-              `<div class="ai-foot">${icon("cpu")} 本机推荐引擎（结合评分、评论、榜单，离线可用）</div>`;
+              aiCardsHtml(items) + foot;
           }
         }
       }
@@ -1120,8 +1261,26 @@ document.addEventListener("click", async e => {
     case "modal-close": closeModal(); break;
     case "confirm-cancel": closeModal(); App._cf(false); break;
     case "confirm-ok": closeModal(); App._cf(true); break;
-    case "go-window": closeModal(); location.hash = "#/window/" + id; break;
-    case "go-canteens": closeModal(); location.hash = "#/canteens"; break;
+    case "go-window": location.hash = "#/window/" + id; break;
+    case "go-canteens": location.hash = "#/canteens"; break;
+    case "go-back": {
+      const from = S.prevRoute;
+      location.hash = ["leaderboard", "canteens", "my", "admin", "merchant"].includes(from) ? "#/" + from : "#/canteens";
+      break;
+    }
+    case "go-back-login": {
+      const from = S.prevRoute;
+      location.hash = ["leaderboard", "canteens", "my"].includes(from) ? "#/" + from : "#/leaderboard";
+      break;
+    }
+    case "dish-vote": {
+      const r = await api(`/api/dishes/${id}/vote`, "POST", { vote: v });
+      if (!r.ok) { toast(r.msg, "err"); return; }
+      toast(v === "good" ? "已记好评，帮同学们避开了踩雷" : "已记差评，感谢真实反馈");
+      renderWindow(S.curWindowId);
+      break;
+    }
+    case "go-avoid": location.hash = "#/avoid"; break;
     case "ai-open": openAiBox(); break;
     case "ai-ask": askAi(); break;
     case "ai-chip": askAi(el.dataset.q); break;
@@ -1144,11 +1303,33 @@ document.addEventListener("click", async e => {
       else toast(r.msg, "err");
       break;
     }
-    case "rate-star": {
-      S.hoverScore = +v;
-      const r = await api("/api/rate", "POST", { window_id: S.curWindowId, score: +v });
+    case "rate-good": {
+      const r = await api("/api/rate", "POST", { window_id: S.curWindowId, score: 5 });
       if (!r.ok) { toast(r.msg, "err"); return; }
-      toast(`已打 ${v} 星，感谢匿名反馈`);
+      toast("好评已提交，谢谢鼓励");
+      await refreshBoot();
+      renderWindow(S.curWindowId);
+      break;
+    }
+    case "rate-bad": {
+      modal(`<h3>${icon("alert")} 提交差评</h3>
+        <div class="warn-line">${icon("info")} <b>不要随意差评。</b>请有理有据地说明情况（哪道菜、什么问题、什么时间），平台<b>支持合理差评</b>——它是食堂改进的重要依据；恶意差评、情绪化攻击会被管理员删除。</div>
+        <div class="field"><label>差评理由（至少 10 个字，匿名发布到该窗口讨论区）</label>
+          <textarea id="badReason" maxlength="300" style="min-height:90px;width:100%;border:1px solid var(--line);border-radius:9px;padding:9px 12px" placeholder="例如：今天点的红烧肉肥肉太多、米饭有点夹生，希望改进"></textarea></div>
+        <div class="m-actions"><button class="btn btn-ghost" data-act="modal-close">取消</button>
+          <button class="btn btn-danger" data-act="rate-bad-submit">提交差评</button></div>`);
+      break;
+    }
+    case "rate-bad-submit": {
+      const ta = $("#badReason");
+      const reason = (ta.value || "").trim();
+      if (reason.length < 10) { toast("差评理由至少 10 个字，请把情况说清楚（有理有据）", "err"); return; }
+      const r1 = await api("/api/rate", "POST", { window_id: S.curWindowId, score: 1 });
+      if (!r1.ok) { toast(r1.msg, "err"); return; }
+      const r2 = await api("/api/posts", "POST", { window_id: S.curWindowId, content: reason, category: "bad" });
+      closeModal();
+      if (!r2.ok) toast("差评已计入，但差评帖发布失败：" + (r2.msg || ""), "err");
+      else toast("差评已提交，感谢有理有据的反馈");
       await refreshBoot();
       renderWindow(S.curWindowId);
       break;
@@ -1158,10 +1339,16 @@ document.addEventListener("click", async e => {
       const content = ta.value.trim();
       if (!content && !S.postPhotoFile) { toast("写点内容或加张照片再发布吧", "err"); return; }
       const dishSel = $("#postDish");
+      const catSel = $("#postCat");
+      const category = catSel ? catSel.value : "";
+      if (category === "bad" && content.length < 10) {
+        toast("差评需要有理有据：请至少用 10 个字说明情况", "err"); return;
+      }
       const r = await api("/api/posts", "POST", {
         window_id: S.curWindowId,
         content: content || "分享一张实拍照片",
         dish_id: dishSel.value ? +dishSel.value : null,
+        category,
       });
       if (!r.ok) { toast(r.msg, "err"); return; }
       if (S.postPhotoFile) {

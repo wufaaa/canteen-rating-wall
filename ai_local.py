@@ -26,8 +26,9 @@ def canteen_name(n):
 # ------------------------------------------------------------ 意图词典：口语 -> 标签
 INTENT_RULES = [
     # (正则, 命中后要求的标签集合/排除的标签集合)
-    (r"热|暑|降温|凉快|冰|清爽|解腻|渴", {"temp": "cool"}),
-    (r"冷|寒|暖|胃寒|降温后|冬天|下雪|冻", {"temp": "hot"}),
+    # 「天热」是要凉的，「想吃热的」是要热的 —— 不能都按「热」字一刀切
+    (r"天热|好热|太热|有点热|热死|暑|降温|凉|冰|清爽|解腻|渴", {"temp": "cool"}),
+    (r"冷|寒|暖|胃寒|冬天|下雪|冻|想吃热|来点热|热的|热乎|热汤|热面", {"temp": "hot"}),
     (r"辣|无辣不欢|过瘾|麻辣|香辣|变态辣", {"taste": "spicy"}),
     (r"清淡|油腻|腻|不想油|少油|养生|清淡点", {"taste": "light"}),
     (r"甜|甜品|糖水|解馋|下午茶|奶茶", {"taste": "sweet"}),
@@ -114,6 +115,34 @@ COMMENT_INTENT_KEYWORDS = {
     "meat": ["肉"],
     "veggie": ["素", "蔬菜"],
 }
+
+
+# ------------------------------------------------------------ 差评归类（避雷）
+# 只对已经命中 COMMENT_BAD 的帖子做归类，避免「分量超足」被误判成「分量少」
+WARN_RULES = [
+    (r"排队|队伍|等(了|快)|人多|挤", "排队久"),
+    (r"分量|量少|没给够|少得|太少|缩水|对付一口", "分量偏少"),
+    (r"咸|淡|油放|腻|没味|寡淡", "口味不稳"),
+    (r"贵|涨价|不值|性价比低", "价格偏高"),
+    (r"卖完|没了|售罄", "容易售罄"),
+    (r"凉了|温的|不热|凉透", "出餐偏凉"),
+    (r"态度|爱答不理|脸色", "服务一般"),
+]
+
+
+def window_warnings(conn):
+    """按窗口汇总差评标签 -> {window_id: [tag, ...]}（确定性规则，不经过模型）"""
+    out = {}
+    for p in conn.execute("SELECT window_id, content FROM posts WHERE status=1"):
+        text = p["content"] or ""
+        if not any(k in text for k in COMMENT_BAD):
+            continue
+        for pat, tag in WARN_RULES:
+            if re.search(pat, text):
+                bucket = out.setdefault(p["window_id"], [])
+                if tag not in bucket:
+                    bucket.append(tag)
+    return out
 
 
 def _comment_signals(conn, intent):
@@ -262,6 +291,7 @@ def recommend(conn, q, limit=3):
     数据每次实时查库：菜品/价格/评分/月榜/学生评论。"""
     intent = parse_intent(q)
     win_comment = _comment_signals(conn, intent)
+    warns = window_warnings(conn)
     rows = conn.execute("""
         SELECT w.id AS wid, w.canteen, w.floor, w.win_no, w.name AS wname,
                d.id AS did, d.name AS dname, d.price, d.intro,
@@ -282,53 +312,83 @@ def recommend(conn, q, limit=3):
             """, (month,))):
             ranks[r["wid"]] = max(0, 20 - i)  # 第1名+20，线性衰减
 
-    scored = []
-    for r in rows:
-        tags = _tag_dish(r["dname"], r["intro"], r["wname"], r["price"])
-        # 硬约束在打分前就筛掉，保证「不辣」「高蛋白」不会靠权重漏进 Top3
-        if intent.get("avoid_spicy") and "spicy" in tags.get("taste", set()):
-            continue
-        if ("high_protein" in intent.get("nutrition", set())
-                and "high_protein" not in tags.get("nutrition", set())):
-            continue
-        avg = r["avg_score"] or 3.5
-        s, matched = _score(tags, intent, avg, ranks.get(r["wid"], 0), r["price"])
-        # 学生直接点名了菜名（「来份锅贴」）：这道菜本身要排前面
-        bare = re.sub(r"[（(].*?[)）]", "", r["dname"]).strip()
-        hit = _name_hit(q, bare)
-        if hit:
-            s += 60 if hit == 9 else 15 * hit
-            matched = ["就是这道"] + matched
-        # 评论信号：口碑分 + 评论对意图的佐证
-        wc = win_comment.get(r["wid"])
-        if wc:
-            s += max(-4, min(4, wc["sent"]))
-            if wc["hits"]:
-                s += 8 * len(wc["hits"])
-        # 有明确意图时：至少命中一个意图维度（菜品标签或评论佐证）才有资格入围
-        if intent:
-            dish_hit = any(vals & tags.get(dim, set()) for dim, vals in intent.items())
-            comment_hit = bool(wc and wc["hits"])
-            if not (dish_hit or comment_hit):
-                continue
-        else:
-            matched = ["高分热推"]
-        scored.append((s, r, matched, tags))
-    if not scored:  # 全被过滤（极端口语）：先只放宽「高蛋白」，「不辣」仍然硬保留
-        relax = {k: v for k, v in intent.items() if k != "nutrition"}
+    # 硬约束：不辣 / 高蛋白 / 预算。三档放宽，先松软约束，最后才松预算
+    budget_cap = min(intent["budget"]) if "budget" in intent else None
+    semantic = {k: v for k, v in intent.items() if k not in ("budget", "avoid_spicy")}
+
+    def _pass(use_protein, use_budget):
+        out = []
         for r in rows:
             tags = _tag_dish(r["dname"], r["intro"], r["wname"], r["price"])
-            if relax.get("avoid_spicy") and "spicy" in tags.get("taste", set()):
+            if intent.get("avoid_spicy") and "spicy" in tags.get("taste", set()):
+                continue
+            if (use_protein and "high_protein" in intent.get("nutrition", set())
+                    and "high_protein" not in tags.get("nutrition", set())):
+                continue
+            if use_budget and budget_cap and r["price"] > budget_cap:
                 continue
             avg = r["avg_score"] or 3.5
-            s, matched = _score(tags, relax, avg, ranks.get(r["wid"], 0), r["price"])
-            scored.append((s, r, matched or ["高分热推"], tags))
+            s, matched = _score(tags, intent, avg, ranks.get(r["wid"], 0), r["price"])
+            # 学生直接点名了菜名（「来份锅贴」）：这道菜本身要排前面
+            bare = re.sub(r"[（(].*?[)）]", "", r["dname"]).strip()
+            hit = _name_hit(q, bare)
+            if hit:
+                s += 60 if hit == 9 else 15 * hit
+                matched = ["就是这道"] + matched
+            wc = win_comment.get(r["wid"])
+            if wc:
+                s += max(-4, min(4, wc["sent"]))
+                if wc["hits"]:
+                    s += 8 * len(wc["hits"])
+            # 有语义意图时：至少命中一个维度（菜品标签或评论佐证）才入围
+            if semantic:
+                dish_hit = any(vals & tags.get(dim, set()) for dim, vals in semantic.items())
+                comment_hit = bool(wc and wc["hits"])
+                if not (dish_hit or comment_hit):
+                    continue
+            else:
+                matched = ["高分热推"]
+            out.append((s, r, matched, tags))
+        return out
+
+    scored = _pass(True, True)
+    if not scored:                      # 放宽高蛋白，预算仍硬
+        scored = _pass(False, True)
+    if not scored:                      # 再放宽预算
+        scored = _pass(False, False)
     if not scored:  # 最后兜底：确实没有任何菜满足约束，退回按评分+榜单
         for r in rows:
             tags = _tag_dish(r["dname"], r["intro"], r["wname"], r["price"])
             avg = r["avg_score"] or 3.5
             scored.append(((avg - 3.0) * 10 + ranks.get(r["wid"], 0), r, ["高分热推"], tags))
     scored.sort(key=lambda x: -x[0])
+    # 没有明确需求（「今天吃啥」）时，别让三条都是主食：
+    # 按「主食 / 汤 / 菜」三组轮转重排，凑成一顿饭
+    if not intent:
+        def _group(tags):
+            cats = tags.get("cat", set())
+            tastes = tags.get("taste", set())
+            if cats & {"rice", "noodle", "dumpling"}:
+                return 0                       # 主食
+            if "soup" in cats:
+                return 1                       # 汤
+            if cats & {"meat", "veggie"}:
+                return 2                       # 菜
+            if "sweet" in tastes:
+                return 3                       # 甜品：只有凑不出饭才用
+            return 2
+
+        groups = {}
+        for item in scored:
+            groups.setdefault(_group(item[3]), []).append(item)
+        reordered = []
+        # 先把 主食/汤/菜 轮转排完，甜品垫在最后
+        while groups.get(0) or groups.get(1) or groups.get(2):
+            for g in (0, 1, 2):
+                if groups.get(g):
+                    reordered.append(groups[g].pop(0))
+        reordered += groups.get(3, [])
+        scored = reordered
     # 多样性：先保证每个窗口最多 1 道，凑不满再放宽到 2 道（避免一个窗口占满 3 个名额）
     picked, win_count, taken = [], {}, set()
     for cap in (1, 2):
@@ -352,7 +412,11 @@ def recommend(conn, q, limit=3):
         reason_bits = []
         if intent.get("avoid_spicy"):
             reason_bits.append("不辣/清淡")
-        if matched:
+        if not intent:
+            # 没明确需求时不要说「符合高分热推」，换成能看懂的依据
+            if ranks.get(r["wid"], 0) >= 18:
+                reason_bits.append("本月榜前列")
+        elif matched:
             reason_bits.append("符合「%s」" % "、".join(matched[:2]))
         if r["price"] <= 10:
             reason_bits.append("¥%g 学生价" % r["price"])
@@ -370,6 +434,7 @@ def recommend(conn, q, limit=3):
             "reason": "，".join(reason_bits)[:40],
             "intro": (r["intro"] or "")[:60],
             "dish_id": r["did"], "window_id": r["wid"],
+            "warn": "、".join(warns.get(r["wid"], [])[:2]),
         })
     return out
 

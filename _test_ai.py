@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 os.chdir(BASE)
@@ -138,14 +139,29 @@ def case2():
            "最大食堂序号=%s；失败 %d 个%s" % (max_canteen, len(bad), ("：" + str(bad[:5])) if bad else ""))
 
 
+def purge(q):
+    """清掉这个问法的缓存（内存 + 预生成表），保证用例真的走到引擎/兜底分支"""
+    import sqlite3
+    appmod._AI_CACHE.clear()
+    try:
+        c = sqlite3.connect(os.path.join(BASE, "canteen.db"))
+        c.execute("DELETE FROM ai_answers WHERE q=?", (q,))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+
 def case3():
-    q = "今天有点热，想吃点凉的"
+    # 用一个没有预生成缓存的问法，才能真正测到「引擎不可用 → 本地兜底」
+    q = "想吃点酸的，开胃"
+    purge(q)
     local_off()
     status, events = sse(q)
     done = get_done(events)
     ok = (status == 200 and done.get("engine") == "local"
           and len(done.get("items") or []) == 3)
-    record(3, "引擎关闭仍出 3 条", ok,
+    record(3, "引擎关闭仍出 3 条（无缓存）", ok,
            "status=%s engine=%s items=%d" % (status, done.get("engine"), len(done.get("items") or [])))
 
 
@@ -218,13 +234,14 @@ def case8():
 
 
 def case9():
-    """真实引擎冒烟（可选）：没启动 TeleAgent 就跳过"""
+    """真实引擎冒烟（可选）：没启动 TeleAgent 就跳过。用一个没有缓存的问法。"""
     import importlib
     importlib.reload(teleagent_client)
     if not teleagent_client.engine_available():
         record(9, "真实引擎冒烟（跳过：TeleAgent 未运行）", True, "engine_available=False")
         return
-    q = "12块以内，不辣，高蛋白"
+    q = "想吃点酸的，开胃"
+    purge(q)
     status, events = sse(q)
     done = get_done(events)
     items = done.get("items") or []
@@ -236,11 +253,25 @@ def case9():
                "、".join("%s ¥%s" % (i["dish"], i["price"]) for i in items)))
 
 
+def case10():
+    """预生成答案命中：高频问题应当秒回，并标注 cached。"""
+    q = "今天吃啥"
+    local_off()
+    t0 = time.time()
+    status, events = sse(q)
+    dt = time.time() - t0
+    done = get_done(events)
+    items = done.get("items") or []
+    ok = status == 200 and len(items) == 3 and dt < 1.5
+    record(10, "预生成答案命中（应 <1.5s）", ok,
+           "status=%s %.2fs note=%r items=%d" % (status, dt, done.get("note"), len(items)))
+
+
 def main():
     print("=" * 62)
     print("智慧食堂 · AI 后端回归测试")
     print("=" * 62)
-    for fn in [case1, case2, case3, case4, case5, case6, case7, case8, case9]:
+    for fn in [case1, case2, case3, case4, case5, case6, case7, case8, case9, case10]:
         try:
             fn()
         except Exception as e:
