@@ -40,7 +40,9 @@ INTENT_RULES = [
     (r"穷|没钱|吃土|便宜|省钱|穷吃|特价|低消", {"scene": "cheap"}),
     (r"请客|聚餐|改善|犒劳|庆祝|生日", {"scene": "rich"}),
     (r"面|粉|拉面|米线|嗦", {"cat": "noodle"}),
-    (r"饺子|水饺|蒸饺|煎饺|锅贴|馄饨|饨|盒子|包子|烧麦", {"cat": "dumpling"}),
+    (r"饺子|水饺|蒸饺|煎饺|锅贴|饺", {"cat": "jiaozi"}),
+    (r"馄饨|云吞|饨", {"cat": "wonton"}),
+    (r"包子|烧麦|盒子", {"cat": "baozi"}),
     (r"饭|盖浇|拌饭|炒饭", {"cat": "rice"}),
     (r"汤|粥|喝的|暖汤", {"cat": "soup"}),
     (r"肉|吃肉|牛肉|鸡肉|羊肉|猪肉|荤", {"cat": "meat"}),
@@ -72,7 +74,9 @@ DISH_TAG_RULES = [
     # noodle：面食粉类
     (r"面|粉|米线|拉面|热干|螺蛳|馄饨|饨|饺子|饺|河粉|肠粉|拌面|炒面|泡馍|宽粉", "cat", "noodle"),
     # dumpling：饺子面点（和面食分开，避免「想吃饺子」推出一堆米粉）
-    (r"饺子|水饺|蒸饺|煎饺|锅贴|馄饨|饨|盒子|包子|烧麦|饺", "cat", "dumpling"),
+    (r"饺子|水饺|蒸饺|煎饺|锅贴|饺", "cat", "jiaozi"),
+    (r"馄饨|云吞|饨", "cat", "wonton"),
+    (r"包子|烧麦|盒子", "cat", "baozi"),
     # rice：米饭类
     (r"饭|盖浇|拌饭|炒饭|卤肉饭|猪脚饭|蛋包饭|套餐|黄焖|烧腊|烧味|叉烧", "cat", "rice"),
     # soup：汤粥类
@@ -88,7 +92,7 @@ TAG_ZH = {
     "sweet": "甜蜜解馋", "sour": "酸爽开胃", "filling": "管饱扛饿", "diet": "轻食低卡",
     "latenight": "适合宵夜", "breakfast": "适合早餐", "cheap": "高性价比", "rich": "犒劳一下",
     "noodle": "面食", "rice": "米饭", "soup": "汤粥", "meat": "肉食", "veggie": "素食",
-    "dumpling": "饺子面点",
+    "jiaozi": "饺子", "wonton": "馄饨", "baozi": "包子面点",
     "high_protein": "高蛋白",
 }
 
@@ -242,7 +246,18 @@ def _score(dish_tags, intent, avg_score, rank_bonus, price):
             s += 45 * len(hit)
             matched += [TAG_ZH.get(v, v) for v in sorted(hit)]
         else:
-            missed += 1
+            # 人类口味：馄饨/包子是饺子的"相近替代"而非同类——半分并如实标注
+            sub = False
+            if "jiaozi" in want_vals and got & {"wonton", "baozi"}:
+                s += 45 * 0.45
+                matched.append("同类面点(非饺子)")
+                sub = True
+            if "wonton" in want_vals and got & {"jiaozi"}:
+                s += 45 * 0.45
+                matched.append("同类面点(非馄饨)")
+                sub = True
+            if not sub:
+                missed += 1
     # 反向惩罚：要凉的给了滚烫的（反之轻罚，热菜冷吃还能接受）
     if "temp" in intent:
         if "cool" in intent["temp"] and "hot" in dish_tags.get("temp", set()):
@@ -334,7 +349,7 @@ def recommend(conn, q, limit=3):
             hit = _name_hit(q, bare)
             if hit:
                 s += 60 if hit == 9 else 15 * hit
-                matched = ["就是这道"] + matched
+                matched = ["名字对口"] + matched
             wc = win_comment.get(r["wid"])
             if wc:
                 s += max(-4, min(4, wc["sent"]))
@@ -342,9 +357,23 @@ def recommend(conn, q, limit=3):
                     s += 8 * len(wc["hits"])
             # 有语义意图时：至少命中一个维度（菜品标签或评论佐证）才入围
             if semantic:
+                # 人类口味规则：学生说出了具体品类（想吃包子/饺子/辣的）时，
+                # "场景命中"（如包子→早餐）不能单独放行——想吃包子不是想吃早餐
+                has_cat = any(d.startswith("cat") for d in semantic)
+                cat_hit = any(vals & tags.get(dim, set()) for dim, vals in semantic.items() if dim.startswith("cat"))
                 dish_hit = any(vals & tags.get(dim, set()) for dim, vals in semantic.items())
                 comment_hit = bool(wc and wc["hits"])
-                if not (dish_hit or comment_hit):
+                sub_hit = any(("jiaozi" in vals and tags.get("cat", set()) & {"wonton", "baozi"}) or
+                              ("wonton" in vals and "jiaozi" in tags.get("cat", set())) for dim, vals in semantic.items())
+                if has_cat:
+                    if not (cat_hit or sub_hit or (comment_hit and dish_hit)):
+                        continue
+                elif not (dish_hit or comment_hit):
+                    continue
+                # 人类口味硬规则：口味反向时评论佐证也不能救——「想吃清淡」绝不推辣菜
+                if semantic.get("taste") and "light" in semantic["taste"] and "spicy" in tags.get("taste", set()):
+                    continue
+                if semantic.get("taste") and "spicy" in semantic["taste"] and "light" in tags.get("taste", set()):
                     continue
             else:
                 matched = ["高分热推"]
@@ -389,18 +418,28 @@ def recommend(conn, q, limit=3):
                     reordered.append(groups[g].pop(0))
         reordered += groups.get(3, [])
         scored = reordered
-    # 多样性：先保证每个窗口最多 1 道，凑不满再放宽到 2 道（避免一个窗口占满 3 个名额）
-    picked, win_count, taken = [], {}, set()
-    for cap in (1, 2):
+    # 多样性（人类口味逻辑）：想吃饺子 ≠ 只在一个食堂里挑。
+    # 三轮放宽：第 1 轮每个食堂最多 1 道（跨食堂给选择），第 2 轮每窗口 1 道，
+    # 第 3 轮才放宽到每窗口 2 道——保证首选最对口、备选分布在不同食堂。
+    picked, win_count, cant_count, taken = [], {}, {}, set()
+    for mode in ("canteen", "window", "window2"):
+        cap = 2 if mode == "window2" else 1
         for item in scored:
             if len(picked) >= limit:
                 break
             if id(item) in taken:
                 continue
             w = item[1]["wid"]
-            if win_count.get(w, 0) >= cap:
+            c = item[1]["canteen"]
+            if mode == "canteen" and cant_count.get(c, 0) >= 1:
                 continue
-            win_count[w] = win_count.get(w, 0) + 1
+            if mode in ("window", "window2") and win_count.get(w, 0) >= cap:
+                continue
+            if mode == "canteen":
+                win_count[w] = win_count.get(w, 0) + 1
+            else:
+                win_count[w] = win_count.get(w, 0) + 1
+            cant_count[c] = cant_count.get(c, 0) + 1
             taken.add(id(item))
             picked.append(item)
         if len(picked) >= limit:
@@ -428,7 +467,7 @@ def recommend(conn, q, limit=3):
             reason_bits.append(r["intro"][:14])
         out.append({
             "dish": r["dname"], "window": r["wname"],
-            "loc": "%s食堂%d楼" % (canteen_name(r["canteen"]), r["floor"]),
+            "loc": ("第四食堂（东油饺子园）%d楼" % r["floor"]) if r["canteen"] == 4 else ("%s食堂%d楼" % (canteen_name(r["canteen"]), r["floor"])),
             "price": round(r["price"], 1),
             "score": round(r["avg_score"] or 3.5, 2),
             "reason": "，".join(reason_bits)[:40],

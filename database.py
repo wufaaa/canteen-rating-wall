@@ -409,12 +409,23 @@ def _migrate():
         wcols = [r[1] for r in conn.execute("PRAGMA table_info(windows)")]
         if "is_buffet" not in wcols:
             conn.execute("ALTER TABLE windows ADD COLUMN is_buffet INTEGER NOT NULL DEFAULT 0")
+        # 商家自报主要食材重量区间（单位克，整数；NULL=未标注）
+        if "weight_min" not in wcols:
+            conn.execute("ALTER TABLE windows ADD COLUMN weight_min INTEGER")
+        if "weight_max" not in wcols:
+            conn.execute("ALTER TABLE windows ADD COLUMN weight_max INTEGER")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS dish_ratings ("
             " id INTEGER PRIMARY KEY AUTOINCREMENT, anon_id INTEGER NOT NULL, dish_id INTEGER NOT NULL,"
             " vote INTEGER NOT NULL, date TEXT NOT NULL, created_at TEXT NOT NULL,"
             " UNIQUE(anon_id, dish_id, date))")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dish_ratings_dish ON dish_ratings(dish_id)")
+        rcols = [r[1] for r in conn.execute("PRAGMA table_info(ratings)")]
+        if "ip_hash" not in rcols:
+            conn.execute("ALTER TABLE ratings ADD COLUMN ip_hash TEXT NOT NULL DEFAULT ''")
+        drcols = [r[1] for r in conn.execute("PRAGMA table_info(dish_ratings)")]
+        if "ip_hash" not in drcols:
+            conn.execute("ALTER TABLE dish_ratings ADD COLUMN ip_hash TEXT NOT NULL DEFAULT ''")
         dcols = [r[1] for r in conn.execute("PRAGMA table_info(dishes)")]
         if "stall" not in dcols:
             conn.execute("ALTER TABLE dishes ADD COLUMN stall TEXT NOT NULL DEFAULT ''")

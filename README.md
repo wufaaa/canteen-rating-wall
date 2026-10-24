@@ -176,6 +176,7 @@ python teleagent_client.py "请只回复四个字：桥接正常"
 ## 📦 部署提示
 
 - 生产环境建议在反向代理（Nginx / Caddy）后运行，并关闭 `debug`。
+- **正式投入使用前**：把 `canteen.db` 从版本库移除并加入 `.gitignore`，避免学生评分与发帖数据随 git 提交泄露；同时重置管理员与全部商家密码。
 - 数据库文件 `canteen.db` 请定期备份（`tool.py db` 已自动保留最近 40 份快照）。
 - 上传目录 `uploads/` 需保证可写。
 

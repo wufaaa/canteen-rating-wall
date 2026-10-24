@@ -2,8 +2,9 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>食堂评分墙 · 匿名打分</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>智慧食堂 · AI 点菜与评分</title>
+<meta name="description" content="智慧食堂：一句话 AI 点菜 + 匿名评分 + 差评避雷 + 自选餐投票">
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="/style.css">
 </head>
@@ -12,13 +13,16 @@
   <div class="topbar-inner">
     <a class="brand" href="#/leaderboard" id="brand">
       <span class="brand-logo" id="brandLogo"></span>
-      <span class="brand-text">食堂评分墙<small>匿名 · 月度榜单</small></span>
+      <span class="brand-text">智慧食堂<small>今天吃什么，问我就好</small></span>
     </a>
     <nav class="nav" id="mainNav"></nav>
     <div class="identity" id="identity"></div>
   </div>
 </header>
 <main id="view" class="view"></main>
+<button id="diceFab" class="dice-fab" title="随便吃点，随机摇一道菜">
+  <span>🎲</span><span>随便吃点</span>
+</button>
 <button id="aiFab" class="ai-fab" data-act="ai-open" title="AI 点菜助手">
   <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/><path d="M20 3v4"/><path d="M22 5h-4"/></svg>
   <span>AI 点菜</span>

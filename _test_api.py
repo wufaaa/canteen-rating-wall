@@ -35,7 +35,7 @@ def main():
     chk("匿名昵称不泄露真实信息", "stu" not in nick.lower() and "@" not in nick, nick)
 
     lb = j(stu.get(B + "/api/leaderboard"))
-    chk("榜单返回 60 条", lb.get("ok") and len(lb["data"]["rows"]) == 60, len(lb["data"]["rows"]) if lb.get("ok") else lb)
+    chk("榜单返回 72 条", lb.get("ok") and len(lb["data"]["rows"]) == 72, len(lb["data"]["rows"]) if lb.get("ok") else lb)
     chk("榜单含上月数据", lb["data"].get("last_month") == "2026-09", lb["data"].get("last_month"))
     chk("榜单行含封面字段", "photo" in lb["data"]["rows"][0])
 
@@ -43,7 +43,7 @@ def main():
     chk("非法月份被拒", bad_month.status_code == 400, bad_month.status_code)
 
     ct = j(stu.get(B + "/api/canteens"))
-    chk("食堂接口 60 窗口", ct.get("ok") and len(ct["data"]["windows"]) == 60)
+    chk("食堂接口 72 窗口", ct.get("ok") and len(ct["data"]["windows"]) == 72)
 
     wd = j(stu.get(B + "/api/windows/1"))
     chk("窗口详情含菜品", wd.get("ok") and len(wd["data"]["dishes"]) > 0)
@@ -156,7 +156,7 @@ def main():
     chk("管理看板可用", dash.get("ok"), dash)
 
     wins = j(adm.get(B + "/api/admin/windows"))
-    chk("管理员窗口列表 60 条", wins.get("ok") and len(wins["data"]["windows"]) == 60)
+    chk("管理员窗口列表 72 条", wins.get("ok") and len(wins["data"]["windows"]) == 72)
 
     r = j(adm.put(B + "/api/admin/windows/1", json={"name": "兰州拉面(改)", "status": 1}))
     chk("管理员改窗口名", r.get("ok"), r)

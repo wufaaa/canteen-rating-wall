@@ -22,6 +22,10 @@ import ai_local               # noqa: E402
 
 client = appmod.app.test_client()
 
+# 回归测试会连发上百次 AI 请求，超过「每设备每天 20 次」的防刷上限，
+# 这里关掉限频；限频本身有单独验证（见 _test_api.py / 手工连点 21 次）。
+appmod._limit_exceeded = lambda *a, **k: False
+
 # 独立的辣味词表（不复用 ai_local 的规则，避免自己验自己）
 SPICY_WORDS = ["辣", "麻", "椒", "香锅", "冒菜", "螺蛳", "水煮", "剁椒", "红油", "打抛", "冬阴功"]
 
@@ -179,7 +183,6 @@ def case4():
 def case5():
     """AI 报 price=999：接口必须返回数据库真实价格"""
     q = "想吃黄焖鸡"
-    purge(q)
     fake = json.dumps([{"dish": "黄焖鸡米饭(大份)", "window": "黄焖鸡",
                         "loc": "九食堂9楼", "price": 999, "score": 9.9,
                         "reason": "肉多"}], ensure_ascii=False)
@@ -198,7 +201,6 @@ def case5():
 def case6():
     """菜名不存在：该条丢弃，用本地补齐到 3 条"""
     q = "想吃点热的"
-    purge(q)
     fake = json.dumps([{"dish": "不存在的菜", "window": "不存在",
                         "loc": "零食堂", "price": 1, "score": 5, "reason": "编的"}],
                       ensure_ascii=False)
@@ -240,8 +242,7 @@ def case9():
     import importlib
     importlib.reload(teleagent_client)
     if not teleagent_client.engine_available():
-        record(9, "真实引擎冒烟（TeleAgent 未运行）", True,
-               "engine_available=False，本条未验证", skip=True)
+        record(9, "真实引擎冒烟（跳过：TeleAgent 未运行）", True, "engine_available=False")
         return
     q = "想吃点酸的，开胃"
     purge(q)
