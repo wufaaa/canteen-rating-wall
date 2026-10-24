@@ -7,7 +7,21 @@
 import re
 import sqlite3
 
-CN = ["一", "二", "三"]
+# 食堂序号 -> 中文名。不再写死 3 个：库里已经有 4 个食堂，
+# 原来 CN[r["canteen"]-1] 在第 4 食堂直接 IndexError，把 /api/ai/stream 打成 500。
+CANTEEN_NAMES = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
+CN = CANTEEN_NAMES  # 兼容旧引用
+
+
+def canteen_name(n):
+    """食堂序号转中文名；超出已知范围退回阿拉伯数字，任何输入都不抛异常。"""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "食堂"
+    if 1 <= n <= len(CANTEEN_NAMES):
+        return CANTEEN_NAMES[n - 1]
+    return "%d" % n
 
 # ------------------------------------------------------------ 意图词典：口语 -> 标签
 INTENT_RULES = [
@@ -25,6 +39,7 @@ INTENT_RULES = [
     (r"穷|没钱|吃土|便宜|省钱|穷吃|特价|低消", {"scene": "cheap"}),
     (r"请客|聚餐|改善|犒劳|庆祝|生日", {"scene": "rich"}),
     (r"面|粉|拉面|米线|嗦", {"cat": "noodle"}),
+    (r"饺子|水饺|蒸饺|煎饺|锅贴|馄饨|饨|盒子|包子|烧麦", {"cat": "dumpling"}),
     (r"饭|盖浇|拌饭|炒饭", {"cat": "rice"}),
     (r"汤|粥|喝的|暖汤", {"cat": "soup"}),
     (r"肉|吃肉|牛肉|鸡肉|羊肉|猪肉|荤", {"cat": "meat"}),
@@ -54,7 +69,9 @@ DISH_TAG_RULES = [
     # breakfast：适合早餐
     (r"粥|包子|豆浆|油条|吐司|贝果|咖啡|牛奶|肠粉|早点|蒸饺|小笼|生煎|手抓饼|蛋饼|蛋酒|热干面|汤包|点心", "scene", "breakfast"),
     # noodle：面食粉类
-    (r"面|粉|米线|拉面|热干|螺蛳|馄饨|饺子|河粉|肠粉|拌面|炒面|泡馍|宽粉", "cat", "noodle"),
+    (r"面|粉|米线|拉面|热干|螺蛳|馄饨|饨|饺子|饺|河粉|肠粉|拌面|炒面|泡馍|宽粉", "cat", "noodle"),
+    # dumpling：饺子面点（和面食分开，避免「想吃饺子」推出一堆米粉）
+    (r"饺子|水饺|蒸饺|煎饺|锅贴|馄饨|饨|盒子|包子|烧麦|饺", "cat", "dumpling"),
     # rice：米饭类
     (r"饭|盖浇|拌饭|炒饭|卤肉饭|猪脚饭|蛋包饭|套餐|黄焖|烧腊|烧味|叉烧", "cat", "rice"),
     # soup：汤粥类
@@ -70,6 +87,8 @@ TAG_ZH = {
     "sweet": "甜蜜解馋", "sour": "酸爽开胃", "filling": "管饱扛饿", "diet": "轻食低卡",
     "latenight": "适合宵夜", "breakfast": "适合早餐", "cheap": "高性价比", "rich": "犒劳一下",
     "noodle": "面食", "rice": "米饭", "soup": "汤粥", "meat": "肉食", "veggie": "素食",
+    "dumpling": "饺子面点",
+    "high_protein": "高蛋白",
 }
 
 # ------------------------------------------------------------ 评论信号（实时读帖）
@@ -122,6 +141,9 @@ def _tag_dish(name, intro, window_name, price):
     for pat, dim, val in DISH_TAG_RULES:
         if re.search(pat, blob):
             tags.setdefault(dim, set()).add(val)
+    # 高蛋白只认菜名/简介里的食材证据，不拿窗口名凑
+    if PROTEIN_DISH.search("%s %s" % (name, intro)):
+        tags.setdefault("nutrition", set()).add("high_protein")
     if price <= 10:
         tags.setdefault("scene", set()).add("cheap")
     if price >= 18:
@@ -129,15 +151,32 @@ def _tag_dish(name, intro, window_name, price):
     return tags
 
 
+# ------------------------------------------------------------ 否定词与高蛋白
+# 「不辣」「不要辣」「少辣」「微辣」里的「辣」会被 INTENT_RULES 的 /辣/ 命中，
+# 结果学生说「不辣」反而推麻辣豆腐。所以先剥离否定短语，再解析意图。
+NEG_SPICY = re.compile(r"(不|不要|别|少|微|没|无)\s*辣")
+
+# 高蛋白必须有食材证据，不能只靠 scene:diet 软加分
+PROTEIN_DISH = re.compile(
+    r"鸡胸|鸡腿|鸡排|鸡块|牛肉|牛腩|肥牛|羊肉|里脊|瘦肉|排骨|猪蹄|鱼|虾|蟹|"
+    r"蛋(?!糕)|豆腐|豆干|豆皮|腐竹|牛奶|酸奶|鸡|鸭|鹅|肉")
+
+
 def parse_intent(q):
     """把学生的话解析成意图标签 dict{dim: set(val)}"""
     intent = {}
+    avoid_spicy = bool(NEG_SPICY.search(q))
+    q2 = NEG_SPICY.sub(" ", q)          # 先把「不辣」整段从原句拿掉
     for pat, want in INTENT_RULES:
-        if re.search(pat, q):
+        if re.search(pat, q2):
             for dim, val in want.items():
                 intent.setdefault(dim, set()).add(val)
+    if avoid_spicy:
+        intent["avoid_spicy"] = {True}
+    if PROTEIN_DISH.search(q2) or re.search(r"高蛋白|增肌|健身|补蛋白", q2):
+        intent.setdefault("nutrition", set()).add("high_protein")
     # 数字预算：「10块」「15元」「20块钱」→ budget
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:块|元)", q)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:块|元)", q2)
     if m:
         try:
             intent["budget"] = {float(m.group(1))}
@@ -152,9 +191,21 @@ def _score(dish_tags, intent, avg_score, rank_bonus, price):
     matched = []
     missed = 0
     budget = None
+    # 硬约束：说「不辣」就不能出现辣菜（哪怕同时说了「麻辣」也以不辣优先）
+    if intent.get("avoid_spicy") and "spicy" in dish_tags.get("taste", set()):
+        return -999, []
     for dim, want_vals in intent.items():
         if dim == "budget":
             budget = min(want_vals)
+            continue
+        if dim == "avoid_spicy":
+            continue                    # 已在上面做硬过滤，不参与加分
+        if dim == "nutrition":
+            if want_vals & dish_tags.get("nutrition", set()):
+                s += 30
+                matched.append("高蛋白")
+            else:
+                missed += 1
             continue
         got = dish_tags.get(dim, set())
         hit = want_vals & got
@@ -186,6 +237,25 @@ def _score(dish_tags, intent, avg_score, rank_bonus, price):
     return s, matched
 
 
+STOP_GRAMS = {"想吃", "来份", "来个", "想要", "吃点", "有点", "一份", "今天", "什么",
+              "推荐", "帮我", "现在", "一些", "我想", "觉得", "可以", "一点", "的话"}
+
+
+def _name_hit(q, bare):
+    """学生话里有没有直接点名这道菜；返回命中片段长度（9=整名命中，0=没命中）"""
+    if len(bare) >= 2 and bare in q:
+        return 9
+    best = 0
+    for n in (3, 2):
+        for i in range(len(q) - n + 1):
+            seg = q[i:i + n]
+            if seg in STOP_GRAMS:
+                continue
+            if seg in bare:
+                best = max(best, n)
+    return best
+
+
 def recommend(conn, q, limit=3):
     """主入口：conn 为食堂 sqlite 连接；返回推荐列表（与 AI 输出同构）
 
@@ -215,8 +285,20 @@ def recommend(conn, q, limit=3):
     scored = []
     for r in rows:
         tags = _tag_dish(r["dname"], r["intro"], r["wname"], r["price"])
+        # 硬约束在打分前就筛掉，保证「不辣」「高蛋白」不会靠权重漏进 Top3
+        if intent.get("avoid_spicy") and "spicy" in tags.get("taste", set()):
+            continue
+        if ("high_protein" in intent.get("nutrition", set())
+                and "high_protein" not in tags.get("nutrition", set())):
+            continue
         avg = r["avg_score"] or 3.5
         s, matched = _score(tags, intent, avg, ranks.get(r["wid"], 0), r["price"])
+        # 学生直接点名了菜名（「来份锅贴」）：这道菜本身要排前面
+        bare = re.sub(r"[（(].*?[)）]", "", r["dname"]).strip()
+        hit = _name_hit(q, bare)
+        if hit:
+            s += 60 if hit == 9 else 15 * hit
+            matched = ["就是这道"] + matched
         # 评论信号：口碑分 + 评论对意图的佐证
         wc = win_comment.get(r["wid"])
         if wc:
@@ -232,20 +314,35 @@ def recommend(conn, q, limit=3):
         else:
             matched = ["高分热推"]
         scored.append((s, r, matched, tags))
-    if not scored:  # 全被过滤（极端口语），回落全量按评分+榜单
+    if not scored:  # 全被过滤（极端口语）：先只放宽「高蛋白」，「不辣」仍然硬保留
+        relax = {k: v for k, v in intent.items() if k != "nutrition"}
+        for r in rows:
+            tags = _tag_dish(r["dname"], r["intro"], r["wname"], r["price"])
+            if relax.get("avoid_spicy") and "spicy" in tags.get("taste", set()):
+                continue
+            avg = r["avg_score"] or 3.5
+            s, matched = _score(tags, relax, avg, ranks.get(r["wid"], 0), r["price"])
+            scored.append((s, r, matched or ["高分热推"], tags))
+    if not scored:  # 最后兜底：确实没有任何菜满足约束，退回按评分+榜单
         for r in rows:
             tags = _tag_dish(r["dname"], r["intro"], r["wname"], r["price"])
             avg = r["avg_score"] or 3.5
             scored.append(((avg - 3.0) * 10 + ranks.get(r["wid"], 0), r, ["高分热推"], tags))
     scored.sort(key=lambda x: -x[0])
-    # 同一窗口最多保留 2 道，保证推荐多样性
-    picked, win_count = [], {}
-    for item in scored:
-        w = item[1]["wid"]
-        if win_count.get(w, 0) >= 2:
-            continue
-        win_count[w] = win_count.get(w, 0) + 1
-        picked.append(item)
+    # 多样性：先保证每个窗口最多 1 道，凑不满再放宽到 2 道（避免一个窗口占满 3 个名额）
+    picked, win_count, taken = [], {}, set()
+    for cap in (1, 2):
+        for item in scored:
+            if len(picked) >= limit:
+                break
+            if id(item) in taken:
+                continue
+            w = item[1]["wid"]
+            if win_count.get(w, 0) >= cap:
+                continue
+            win_count[w] = win_count.get(w, 0) + 1
+            taken.add(id(item))
+            picked.append(item)
         if len(picked) >= limit:
             break
     scored = picked
@@ -253,6 +350,8 @@ def recommend(conn, q, limit=3):
     out = []
     for s, r, matched, tags in scored[:limit]:
         reason_bits = []
+        if intent.get("avoid_spicy"):
+            reason_bits.append("不辣/清淡")
         if matched:
             reason_bits.append("符合「%s」" % "、".join(matched[:2]))
         if r["price"] <= 10:
@@ -265,7 +364,7 @@ def recommend(conn, q, limit=3):
             reason_bits.append(r["intro"][:14])
         out.append({
             "dish": r["dname"], "window": r["wname"],
-            "loc": "%s食堂%d楼" % (CN[r["canteen"] - 1], r["floor"]),
+            "loc": "%s食堂%d楼" % (canteen_name(r["canteen"]), r["floor"]),
             "price": round(r["price"], 1),
             "score": round(r["avg_score"] or 3.5, 2),
             "reason": "，".join(reason_bits)[:40],

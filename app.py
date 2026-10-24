@@ -811,7 +811,7 @@ def api_my():
 # ---------------------------------------------------------------- AI 点菜助手
 def _ai_data_summary(conn):
     """把菜品+评分+月榜+学生评论压成紧凑文本喂给 TeleAgent 智能体（每次实时查库）"""
-    cn = ["一", "二", "三"]
+    import ai_local                      # 食堂名统一走 ai_local.canteen_name，不再第二份硬编码
     rows = conn.execute("""
         SELECT w.id AS wid, w.canteen, w.floor, w.name AS wname, d.name AS dname, d.price, d.intro,
                (SELECT ROUND(AVG(r.score),2) FROM ratings r WHERE r.window_id=w.id) AS avg_score
@@ -840,13 +840,13 @@ def _ai_data_summary(conn):
     parts = ["【菜品数据】格式：位置|菜名|价格|简介|窗口评分"]
     for r in rows:
         parts.append("%s食堂%d楼%s|%s|¥%.1f|%s|评分%s" % (
-            cn[r["canteen"] - 1], r["floor"], r["wname"], r["dname"],
+            ai_local.canteen_name(r["canteen"]), r["floor"], r["wname"], r["dname"],
             r["price"], r["intro"], r["avg_score"] or "暂无"))
     if board_rows:
         parts.append("\n【本月榜单Top10】")
         for i, b in enumerate(board_rows):
             parts.append("%d.%s(%s食堂%d楼) 均分%s/%s人评" % (
-                i + 1, b["wname"], cn[b["canteen"] - 1], b["floor"], b["a"], b["n"]))
+                i + 1, b["wname"], ai_local.canteen_name(b["canteen"]), b["floor"], b["a"], b["n"]))
     parts.append("\n【学生评论精选】每窗口点赞最高的评论（截选，反映分量/口味/排队等真实口碑）")
     wins = {}
     for r in rows:
@@ -856,14 +856,13 @@ def _ai_data_summary(conn):
         if not cs:
             continue
         joined = " / ".join("「%s」赞%d" % (c[:40], l) for c, l in cs[:2])
-        parts.append("%s食堂%d楼%s：%s" % (cn[c - 1], f, name, joined))
+        parts.append("%s食堂%d楼%s：%s" % (ai_local.canteen_name(c), f, name, joined))
     return "\n".join(parts)
 
 
 def _ai_data_summary_fast(conn, q):
     """极速版数据摘要：本地引擎预筛候选菜，只把相关数据喂给模型（输入压缩到约1/4）"""
     import ai_local
-    cn = ["一", "二", "三"]
     candidates = ai_local.recommend(conn, q, limit=45)
     if not candidates:
         return _ai_data_summary(conn)
@@ -902,7 +901,7 @@ def _ai_data_summary_fast(conn, q):
         parts.append("\n【本月榜单Top10】")
         for i, b in enumerate(board_rows):
             parts.append("%d.%s(%s食堂%d楼) 均分%s/%s人评" % (
-                i + 1, b["wname"], cn[b["canteen"] - 1], b["floor"], b["a"], b["n"]))
+                i + 1, b["wname"], ai_local.canteen_name(b["canteen"]), b["floor"], b["a"], b["n"]))
     win_names = {c["window_id"]: (c["loc"], c["window"]) for c in candidates if c.get("window_id")}
     if comments_by_win:
         parts.append("\n【候选窗口学生评论精选】")
@@ -969,13 +968,23 @@ def _parse_ai_items(text):
                 continue
             dish = str(a.get("dish") or a.get("name") or "").strip()
             if not dish:
-                continue
+                continue                    # schema：dish 必填
+            price = a.get("price")
+            if isinstance(price, bool) or not isinstance(price, (int, float)):
+                price = None
+            elif not (0 <= price <= 100):
+                price = None                # schema：price 0~100，越界丢弃
+            score = a.get("score")
+            if isinstance(score, bool) or not isinstance(score, (int, float)):
+                score = None
+            elif not (0 <= score <= 5):
+                score = None                # schema：score 0~5，越界丢弃
             items.append({
                 "dish": dish[:40],
                 "window": str(a.get("window") or "").strip()[:30],
                 "loc": str(a.get("loc") or "").strip()[:30],
-                "price": a.get("price") if isinstance(a.get("price"), (int, float)) else None,
-                "score": a.get("score") if isinstance(a.get("score"), (int, float)) else None,
+                "price": price,
+                "score": score,
                 "reason": str(a.get("reason") or "").strip()[:80],
                 "intro": str(a.get("intro") or "").strip()[:80],
             })
@@ -983,19 +992,100 @@ def _parse_ai_items(text):
 
 
 def _attach_dish_info(conn, items):
-    """按菜名回查 dish_id/window_id/照片/介绍，前端可点击跳转窗口详情"""
-    for it in items:
-        row = conn.execute(
-            "SELECT d.id AS did, d.photo, d.intro, w.id AS wid FROM dishes d JOIN windows w ON w.id=d.window_id "
-            "WHERE d.name LIKE ? AND d.status=1 LIMIT 1", (it["dish"],)).fetchone()
-        if row:
-            it["dish_id"] = row["did"]
-            it["window_id"] = row["wid"]
-            if row["photo"]:
-                it["photo"] = row["photo"]
-            if not it.get("intro") and row["intro"]:
-                it["intro"] = row["intro"][:80]
-    return items
+    """AI 只负责「选哪道菜 + 写理由」；价格/窗口/位置/评分一律以数据库为准。
+    菜名在库里对不上就丢弃，绝不把 AI 编的价格放给前端。"""
+    import ai_local
+    fixed = []
+    for it in items or []:
+        name = (it.get("dish") or "").strip()
+        if not name:
+            continue
+        rows = conn.execute(
+            "SELECT d.id AS did, d.name AS dname, d.price, d.intro, d.photo, "
+            "       w.id AS wid, w.name AS wname, w.canteen, w.floor, "
+            "       (SELECT ROUND(AVG(r.score),2) FROM ratings r WHERE r.window_id=w.id) AS avg_score "
+            "FROM dishes d JOIN windows w ON w.id=d.window_id "
+            "WHERE d.status=1 AND w.status=1 AND d.name=? ORDER BY d.id", (name,)).fetchall()
+        if not rows:
+            continue                        # 菜名不存在 → 丢弃
+        row = rows[0]
+        for cand in rows:                   # 同名菜：优先取 AI 说的那个窗口
+            if it.get("window") and cand["wname"] == it["window"]:
+                row = cand
+                break
+        it["dish"] = row["dname"]
+        it["dish_id"] = row["did"]
+        it["window_id"] = row["wid"]
+        it["window"] = row["wname"]
+        it["loc"] = "%s食堂%d楼" % (ai_local.canteen_name(row["canteen"]), row["floor"])
+        it["price"] = round(row["price"], 1)            # 覆盖 AI 价格
+        it["score"] = round(row["avg_score"] or 3.5, 2)  # 覆盖 AI 评分
+        if row["photo"]:
+            it["photo"] = row["photo"]
+        if row["intro"]:
+            it["intro"] = row["intro"][:80]
+        fixed.append(it)
+        if len(fixed) >= 3:
+            break
+    return fixed
+
+
+def _finalize_ai_items(conn, items, q="", want=3):
+    """AI 结果落地：数据库覆盖 → 不足 3 条用本地引擎补齐 → 「不辣」时清掉理由里的辣字。"""
+    import ai_local
+    fixed = _attach_dish_info(conn, items)
+    if len(fixed) < want:
+        seen = {(x.get("dish_id"), x.get("window_id")) for x in fixed}
+        try:
+            for loc in ai_local.recommend(conn, q or "", limit=want + 4):
+                key = (loc.get("dish_id"), loc.get("window_id"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                fixed.append(dict(loc))
+                if len(fixed) >= want:
+                    break
+        except Exception as e:
+            print("[ai] 本地补齐失败：%r" % e, flush=True)
+    if q and ai_local.NEG_SPICY.search(q):
+        for it in fixed:
+            r = it.get("reason") or ""
+            if "辣" in r:
+                bits = [b for b in r.split("，") if "辣" not in b]
+                it["reason"] = ("，".join(bits)[:40]) or "不辣/清淡"
+    return fixed[:want]
+
+
+def _local_fallback_items(conn, q, want=3):
+    """本地兜底：引擎挂了/超时/JSON 不合法时，保证一定有 3 条。"""
+    import ai_local
+    try:
+        got = ai_local.recommend(conn, q or "", limit=want)
+    except Exception as e:
+        print("[ai] 本地推荐异常：%r" % e, flush=True)
+        got = []
+    if got:
+        return got
+    rows = conn.execute(
+        "SELECT d.id AS did, d.name AS dname, d.price, d.intro, w.id AS wid, "
+        "       w.name AS wname, w.canteen, w.floor, "
+        "       (SELECT ROUND(AVG(r.score),2) FROM ratings r WHERE r.window_id=w.id) AS avg_score "
+        "FROM dishes d JOIN windows w ON w.id=d.window_id "
+        "WHERE d.status=1 AND w.status=1 "
+        "ORDER BY (SELECT AVG(r.score) FROM ratings r WHERE r.window_id=w.id) DESC, d.id LIMIT ?",
+        (want,)).fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "dish": r["dname"], "window": r["wname"],
+            "loc": "%s食堂%d楼" % (ai_local.canteen_name(r["canteen"]), r["floor"]),
+            "price": round(r["price"], 1),
+            "score": round(r["avg_score"] or 3.5, 2),
+            "reason": "评分最高的窗口菜",
+            "intro": (r["intro"] or "")[:60],
+            "dish_id": r["did"], "window_id": r["wid"],
+        })
+    return out
 
 
 def _ai_cloud_fast(q, summary, timeout=8):
@@ -1064,7 +1154,7 @@ def api_ai_recommend():
         engine = "local"
     elif engine == "teleagent":
         with get_db() as c:
-            items = _attach_dish_info(c, items)
+            items = _finalize_ai_items(c, items, q)
 
     if not items:
         return err("暂时没推出来，换个说法试试（比如「想吃点凉的」）")
@@ -1090,7 +1180,8 @@ def _run_teleagent_job(job_id, q):
         items = _parse_ai_items(answer)
         if items:
             with get_db() as c:
-                items = _attach_dish_info(c, items)
+                items = _finalize_ai_items(c, items, q)
+        if items:
             _AI_JOBS[job_id].update(status="done", items=items, engine="teleagent")
         else:
             _AI_JOBS[job_id].update(status="failed", error="模型没返回有效结果")
@@ -1106,7 +1197,7 @@ def _run_teleagent_job(job_id, q):
                 _AI_JOBS.pop(k, None)
 
 
-def _run_engine_job(job_id, prompt):
+def _run_engine_job(job_id, prompt, q=""):
     """后台线程：走 4397 引擎直连（约 4 秒），结果写回 _AI_JOBS"""
     try:
         import teleagent_client
@@ -1115,7 +1206,8 @@ def _run_engine_job(job_id, prompt):
         items = _parse_ai_items(answer)
         if items:
             with get_db() as c:
-                items = _attach_dish_info(c, items)
+                items = _finalize_ai_items(c, items, q)
+        if items:
             _AI_JOBS[job_id].update(status="done", items=items, engine="engine")
         else:
             _AI_JOBS[job_id].update(status="failed", error="模型没返回有效结果")
@@ -1152,7 +1244,7 @@ def api_ai_quick():
         cloud = _ai_cloud_fast(q, summary, timeout=8)
         if cloud:
             with get_db() as c:
-                cloud = _attach_dish_info(c, cloud)
+                cloud = _finalize_ai_items(c, cloud, q)
             return ok({"q": q, "engine": "cloud", "items": cloud,
                        "job_id": None, "upgrading": False, "can_upgrade": False})
     except Exception as e:
@@ -1170,7 +1262,7 @@ def api_ai_quick():
                 job_id = "aijob-%d-%s" % (_AI_JOB_SEQ[0], secrets.token_hex(4))
                 _AI_JOBS[job_id] = {"status": "running", "items": None, "error": None,
                                     "q": q, "ts": datetime.now(CN_TZ).timestamp()}
-            threading.Thread(target=_run_engine_job, args=(job_id, prompt), daemon=True).start()
+            threading.Thread(target=_run_engine_job, args=(job_id, prompt, q), daemon=True).start()
     except Exception as e:
         print("[ai] 引擎任务启动失败：%r" % e, flush=True)
 
@@ -1201,7 +1293,7 @@ def api_ai_upgrade():
     if engine_ok:
         with get_db() as c:
             prompt = _ai_compact_prompt(c, q)
-        threading.Thread(target=_run_engine_job, args=(job_id, prompt), daemon=True).start()
+        threading.Thread(target=_run_engine_job, args=(job_id, prompt, q), daemon=True).start()
     else:
         threading.Thread(target=_run_teleagent_job, args=(job_id, q), daemon=True).start()
     return ok({"job_id": job_id})
@@ -1209,19 +1301,30 @@ def api_ai_upgrade():
 
 @app.route("/api/ai/stream", methods=["POST"])
 def api_ai_stream():
-    """流式版：SSE 推送本地结果 + 引擎正文 delta + 最终结构化推荐（含理由/介绍）。"""
+    """流式版：SSE 推送本地结果 + 引擎正文 delta + 最终结构化推荐（含理由/介绍）。
+    原则：任何环节出错都不许 500 —— 先出本地 3 条，再发 done。"""
     data = request.get_json(force=True, silent=True) or {}
     q = (data.get("q") or "").strip()
     if not q or len(q) > 60:
         return err("用一句话说说你想吃什么（60 字内）")
 
-    import ai_local
     import teleagent_client
-    with get_db() as c:
-        local_items = ai_local.recommend(c, q)
-        prompt = _ai_compact_prompt(c, q)
-    if not local_items:
-        return err("暂时没推出来，换个说法试试（比如「想吃点凉的」）")
+
+    # 1) 本地兜底先算出来，后面任何一步失败都还有东西可发
+    local_items = []
+    try:
+        with get_db() as c:
+            local_items = _local_fallback_items(c, q)
+    except Exception as e:
+        print("[ai] stream 本地兜底异常：%r" % e, flush=True)
+
+    # 2) 提示词构建放进 try：原来它在 gen() 外面，第 4 食堂越界就把整个请求打成 500
+    prompt = None
+    try:
+        with get_db() as c:
+            prompt = _ai_compact_prompt(c, q)
+    except Exception as e:
+        print("[ai] stream 提示词构建失败：%r" % e, flush=True)
 
     def gen():
         import json as _json
@@ -1230,33 +1333,52 @@ def api_ai_stream():
             return "event: %s\ndata: %s\n\n" % (evt, _json.dumps(payload, ensure_ascii=False))
 
         yield send("local", {"items": local_items})
-        if not teleagent_client.engine_available():
+        if not prompt:
+            print("[ai] stream: prompt unavailable, local only", flush=True)
+            yield send("done", {"items": local_items, "engine": "local",
+                                "note": "engine prompt unavailable"})
+            return
+        try:
+            engine_ok = teleagent_client.engine_available()
+        except Exception as e:
+            print("[ai] stream engine_available 异常：%r" % e, flush=True)
+            engine_ok = False
+        if not engine_ok:
             print("[ai] stream: engine unavailable", flush=True)
             yield send("done", {"items": local_items, "engine": "local"})
             return
         buf = ""
         model = os.environ.get("AI_ENGINE_MODEL", "chat-lite")
-        for chunk in teleagent_client.engine_stream(prompt, model=model, timeout=12):
-            if chunk["type"] == "delta":
-                if chunk.get("part") == "text":
-                    buf += chunk["text"]
-                yield send("delta", {"text": chunk["text"], "part": chunk.get("part")})
-            elif chunk["type"] == "error":
-                print("[ai] stream error: %s" % chunk.get("message"), flush=True)
-                yield send("done", {"items": local_items, "engine": "local",
-                                    "note": chunk.get("message")})
-                return
-            elif chunk["type"] == "done":
-                full = chunk.get("full") or buf
-                items = _parse_ai_items(full)
-                print("[ai] stream done: full=%d items=%d" % (len(full), len(items)), flush=True)
-                if items:
-                    with get_db() as c:
-                        items = _attach_dish_info(c, items)
-                    yield send("done", {"items": items, "engine": "engine"})
-                else:
-                    yield send("done", {"items": local_items, "engine": "local"})
-                return
+        try:
+            for chunk in teleagent_client.engine_stream(prompt, model=model, timeout=12):
+                if chunk["type"] == "delta":
+                    if chunk.get("part") == "text":
+                        buf += chunk["text"]
+                    yield send("delta", {"text": chunk["text"], "part": chunk.get("part")})
+                elif chunk["type"] == "error":
+                    print("[ai] stream error: %s" % chunk.get("message"), flush=True)
+                    yield send("done", {"items": local_items, "engine": "local",
+                                        "note": chunk.get("message")})
+                    return
+                elif chunk["type"] == "done":
+                    full = chunk.get("full") or buf
+                    items = _parse_ai_items(full)
+                    print("[ai] stream done: full=%d items=%d" % (len(full), len(items)), flush=True)
+                    if items:
+                        with get_db() as c:
+                            items = _finalize_ai_items(c, items, q)
+                        if items:
+                            yield send("done", {"items": items, "engine": "engine"})
+                            return
+                    yield send("done", {"items": local_items, "engine": "local",
+                                        "note": "engine returned no valid items"})
+                    return
+            yield send("done", {"items": local_items, "engine": "local",
+                                "note": "engine stream ended without done"})
+        except Exception as e:
+            print("[ai] stream 引擎异常：%r" % e, flush=True)
+            yield send("done", {"items": local_items, "engine": "local",
+                                "note": "engine exception: %s" % e})
 
     return Response(gen(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache",
